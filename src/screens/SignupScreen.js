@@ -1,48 +1,61 @@
+// src/screens/SignupScreen.js
 import React, { useState } from 'react';
-import { View, Text, TextInput, Button, StyleSheet, Alert, TouchableOpacity } from 'react-native';
-import { createUserWithEmailAndPassword } from 'firebase/auth';
-import { doc, setDoc } from 'firebase/firestore';
-import { auth, db } from '../services/firebase'; // Adjust path if needed
+import { View, Text, TextInput, Button, StyleSheet, Alert, TouchableOpacity, ActivityIndicator } from 'react-native';
+import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth';
+import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { auth, db } from '../services/firebase';
 
 export default function SignupScreen({ navigation }) {
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
 
   const handleSignUp = async () => {
-    if (!email || !password || !displayName) {
-      Alert.alert('Error', 'Please fill all fields.');
+    setError('');
+    const e = email.trim();
+
+    if (!e || !password || !displayName) {
+      setError('Please fill all fields.');
       return;
     }
     if (password !== confirmPassword) {
-      Alert.alert('Error', 'Passwords do not match.');
+      setError('Passwords do not match.');
       return;
     }
 
-    setLoading(true);
+    setSubmitting(true);
     try {
-      // 1. Create user in Firebase Auth
-      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-      const user = userCredential.user;
+      // 1) Create user in Firebase Auth
+      const { user } = await createUserWithEmailAndPassword(auth, e, password);
 
-      // 2. Assign role based on email
-      const role = email.endsWith('@playwellball.com') ? 'staff' : 'player';
+      // 2) Optional: set displayName on the Auth user (helps in UI)
+      try {
+        await updateProfile(user, { displayName });
+      } catch {}
 
-      // 3. Add user doc to Firestore
+      // 3) Assign role — staff if using company email, otherwise player
+      const role = e.toLowerCase().endsWith('@playwellball.com') ? 'staff' : 'player';
+
+      // 4) Seed the Firestore user document (doc id MUST be the auth uid)
       await setDoc(doc(db, 'users', user.uid), {
         displayName,
-        email,
+        email: e,
         role,
+        createdAt: serverTimestamp(),
       });
 
-      Alert.alert('Success', 'Account created! You can now log in.');
-      navigation.replace('Login');
-    } catch (error) {
-      Alert.alert('Signup Error', error.message);
+      // 5) Do NOT navigate. App.js onAuthStateChanged will switch to MainTabs automatically.
+      // If you prefer to force navigation instead, uncomment:
+      // navigation.reset({ index: 0, routes: [{ name: 'MainTabs' }] });
+
+    } catch (err) {
+      setError(err?.message ?? 'Sign up failed.');
+    } finally {
+      setSubmitting(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -55,7 +68,9 @@ export default function SignupScreen({ navigation }) {
         value={displayName}
         onChangeText={setDisplayName}
         autoCapitalize="words"
+        editable={!submitting}
       />
+
       <TextInput
         style={styles.input}
         placeholder="Email"
@@ -63,7 +78,10 @@ export default function SignupScreen({ navigation }) {
         onChangeText={setEmail}
         autoCapitalize="none"
         keyboardType="email-address"
+        autoCorrect={false}
+        editable={!submitting}
       />
+
       <TextInput
         style={styles.input}
         placeholder="Password"
@@ -71,7 +89,9 @@ export default function SignupScreen({ navigation }) {
         onChangeText={setPassword}
         autoCapitalize="none"
         secureTextEntry
+        editable={!submitting}
       />
+
       <TextInput
         style={styles.input}
         placeholder="Confirm Password"
@@ -79,17 +99,22 @@ export default function SignupScreen({ navigation }) {
         onChangeText={setConfirmPassword}
         autoCapitalize="none"
         secureTextEntry
+        editable={!submitting}
       />
 
+      {error ? <Text style={{ color: 'red', marginBottom: 12 }}>{error}</Text> : null}
+      {submitting ? <ActivityIndicator style={{ marginBottom: 12 }} /> : null}
+
       <Button
-        title={loading ? 'Signing Up...' : 'Sign Up'}
+        title={submitting ? 'Signing Up...' : 'Sign Up'}
         onPress={handleSignUp}
-        disabled={loading}
+        disabled={submitting}
       />
 
       <TouchableOpacity
         onPress={() => navigation.replace('Login')}
         style={{ marginTop: 24 }}
+        disabled={submitting}
       >
         <Text style={{ color: '#007bff', textAlign: 'center' }}>
           Already have an account? Log in

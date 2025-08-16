@@ -1,139 +1,206 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, TouchableOpacity, ActivityIndicator, TextInput, StyleSheet } from 'react-native';
+// src/screens/TeamPicker.js
+import React, { useEffect, useMemo, useState } from 'react';
+import { View, Text, TouchableOpacity, ActivityIndicator, FlatList, Alert, StyleSheet, TextInput } from 'react-native';
 import { db } from '../services/firebase';
-import { collection, getDocs } from 'firebase/firestore';
+import { collection, getDocs, doc, getDoc } from 'firebase/firestore';
 import { createGame } from '../services/gameService';
 
-export default function TeamPicker({ navigation }) {
+export default function TeamPicker({ navigation, route }) {
+  const { eventId = null } = route?.params || {};
   const [loading, setLoading] = useState(true);
   const [users, setUsers] = useState([]);
-  const [filter, setFilter] = useState('');
+  const [sequences, setSequences] = useState([]);
   const [teamA, setTeamA] = useState([]);
   const [teamB, setTeamB] = useState([]);
-  const [sequence, setSequence] = useState(null); // pick one for MVP
-  const [sequenceChallengeIds, setSequenceChallengeIds] = useState([]);
+  const [selectedSequenceId, setSelectedSequenceId] = useState(null);
+
+  // NEW: search state
+  const [queryStr, setQueryStr] = useState('');
 
   useEffect(() => {
-    const fetchUsers = async () => {
-      const snap = await getDocs(collection(db, 'users'));
-      setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-      setLoading(false);
+    const load = async () => {
+      try {
+        const uSnap = await getDocs(collection(db, 'users'));
+        setUsers(uSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+
+        const sSnap = await getDocs(collection(db, 'sequences'));
+        const seqs = sSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        setSequences(seqs);
+        if (!selectedSequenceId && seqs.length > 0) {
+          setSelectedSequenceId(seqs[0].id); // default first sequence
+        }
+      } catch (e) {
+        Alert.alert('Error', e.message);
+      } finally {
+        setLoading(false);
+      }
     };
-    const fetchSequence = async () => {
-      // MVP: hardcode or fetch one default sequence with a few challenges
-      // Replace this with your real sequence picker UI
-      // Example defaults:
-      setSequence({ id: 'default-seq', name: 'Default Sequence' });
-      setSequenceChallengeIds(['challenge1', 'challenge2', 'challenge3']); // ensure these exist in /challenges
-    };
-    fetchUsers();
-    fetchSequence();
+    load();
   }, []);
 
-  const addToTeam = (teamSetter, team, player) => {
-    if (team.find(p => p.id === player.id)) return;
-    teamSetter([...team, player]);
-  };
-  const removeFromTeam = (teamSetter, team, player) => {
-    teamSetter(team.filter(p => p.id !== player.id));
+  // Quick toggle helpers (unchanged)
+  const toggleOnTeam = (teamSetter, team, uid) => {
+    if (team.includes(uid)) {
+      teamSetter(team.filter(id => id !== uid));
+    } else {
+      teamSetter([...team, uid]);
+    }
   };
 
   const startMatch = async () => {
-    const teamAIds = teamA.map(p => p.id);
-    const teamBIds = teamB.map(p => p.id);
-    if (teamAIds.length === 0 || teamBIds.length === 0) {
-      alert('Pick at least one player for each team');
-      return;
+    try {
+      if (!selectedSequenceId) return Alert.alert('Pick a sequence');
+      if (teamA.length === 0 || teamB.length === 0) return Alert.alert('Pick at least one player per team');
+
+      // Load the chosen sequence to get its ordered challengeIds
+      const seqSnap = await getDoc(doc(db, 'sequences', selectedSequenceId));
+      if (!seqSnap.exists()) throw new Error('Sequence not found');
+      const seq = seqSnap.data();
+      const sequenceChallengeIds = Array.isArray(seq.challengeIds) ? seq.challengeIds : [];
+
+      const gameId = await createGame({
+        teamAIds: teamA,
+        teamBIds: teamB,
+        sequenceId: selectedSequenceId,
+        sequenceChallengeIds,
+        clockSeconds: 90,
+        secondaryKeeper: null,
+        eventId,
+      });
+
+      navigation.replace('StatEntryScreen', { gameId });
+    } catch (e) {
+      Alert.alert('Could not start match', e.message);
     }
-    if (!sequence) {
-      alert('Select a challenge sequence');
-      return;
-    }
-    const gameId = await createGame({
-      teamAIds,
-      teamBIds,
-      sequenceId: sequence.id,
-      sequenceChallengeIds,
-      clockSeconds: 90
-    });
-    navigation.navigate('StatEntryScreen', { gameId, role: 'main' });
   };
+
+  // NEW: filtered users based on query string
+  const filteredUsers = useMemo(() => {
+    const q = queryStr.trim().toLowerCase();
+    if (!q) return users;
+    return users.filter(u => {
+      const name = String(u.displayName || '').toLowerCase();
+      const email = String(u.email || '').toLowerCase();
+      const id = String(u.id || '').toLowerCase();
+      return name.includes(q) || email.includes(q) || id.includes(q);
+    });
+  }, [users, queryStr]);
 
   if (loading) return <ActivityIndicator style={{ marginTop: 40 }} />;
 
-  const filtered = users.filter(u =>
-    (u.displayName || u.email || '').toLowerCase().includes(filter.toLowerCase())
-  );
-
   return (
     <View style={styles.container}>
-      <Text style={styles.h1}>Game Setup</Text>
+      <Text style={styles.h1}>Team Picker</Text>
 
-      <TextInput
-        placeholder="Search players"
-        value={filter}
-        onChangeText={setFilter}
-        style={styles.search}
+      <Text style={styles.h2}>Sequence</Text>
+      <FlatList
+        data={sequences}
+        keyExtractor={s => s.id}
+        horizontal
+        renderItem={({ item }) => (
+          <TouchableOpacity
+            style={[styles.pill, selectedSequenceId === item.id && styles.pillActive]}
+            onPress={() => setSelectedSequenceId(item.id)}
+          >
+            <Text style={[styles.pillTxt, selectedSequenceId === item.id && styles.pillTxtActive]}>
+              {item.name || item.id}
+            </Text>
+          </TouchableOpacity>
+        )}
+        ListEmptyComponent={<Text>No sequences</Text>}
+        style={{ marginBottom: 12 }}
+        showsHorizontalScrollIndicator={false}
       />
 
-      <View style={styles.row}>
-        <View style={styles.col}>
-          <Text style={styles.h2}>All Players</Text>
-          <FlatList
-            data={filtered}
-            keyExtractor={(item) => item.id}
-            renderItem={({ item }) => (
-              <View style={styles.itemRow}>
-                <Text style={styles.player}>{item.displayName || item.email}</Text>
-                <View style={styles.actions}>
-                  <TouchableOpacity onPress={() => addToTeam(setTeamA, teamA, item)} style={styles.btn}>
-                    <Text>A+</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity onPress={() => addToTeam(setTeamB, teamB, item)} style={styles.btn}>
-                    <Text>B+</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            )}
-            style={{ maxHeight: 220 }}
-          />
-        </View>
-
-        <View style={styles.col}>
-          <Text style={styles.h2}>Team A</Text>
-          {teamA.map(p => (
-            <TouchableOpacity key={p.id} onPress={() => removeFromTeam(setTeamA, teamA, p)} style={styles.tag}>
-              <Text>{p.displayName || p.email}</Text>
-            </TouchableOpacity>
-          ))}
-
-          <Text style={[styles.h2, { marginTop: 16 }]}>Team B</Text>
-          {teamB.map(p => (
-            <TouchableOpacity key={p.id} onPress={() => removeFromTeam(setTeamB, teamB, p)} style={styles.tag}>
-              <Text>{p.displayName || p.email}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
+      <View style={styles.rowBetween}>
+        <Text style={styles.h2}>Players</Text>
+        {/* quick glance of selected counts */}
+        <Text style={styles.selectedMeta}>A: {teamA.length} • B: {teamB.length}</Text>
       </View>
 
-      <TouchableOpacity onPress={startMatch} style={styles.start}>
-        <Text style={{ color: 'white', fontSize: 16 }}>Start Match</Text>
+      {/* NEW: search box */}
+      <View style={styles.searchWrap}>
+        <TextInput
+          placeholder="Search players by name, email, or ID"
+          value={queryStr}
+          onChangeText={setQueryStr}
+          style={styles.searchInput}
+          autoCorrect={false}
+          autoCapitalize="none"
+        />
+        {queryStr.length > 0 && (
+          <TouchableOpacity onPress={() => setQueryStr('')} style={styles.clearBtn}>
+            <Text style={styles.clearTxt}>Clear</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <FlatList
+        data={filteredUsers}
+        keyExtractor={u => u.id}
+        keyboardShouldPersistTaps="handled"
+        renderItem={({ item }) => {
+          const label = item.displayName || item.email || item.id;
+          const onA = teamA.includes(item.id);
+          const onB = teamB.includes(item.id);
+          return (
+            <View style={styles.userRow}>
+              <Text style={{ flex: 1 }} numberOfLines={1}>{label}</Text>
+              <TouchableOpacity
+                style={[styles.btn, onA && styles.btnOn]}
+                onPress={() => toggleOnTeam(setTeamA, teamA, item.id)}
+              >
+                <Text style={[styles.btnTxt, onA && styles.btnOnTxt]}>Team A</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.btn, onB && styles.btnOn]}
+                onPress={() => toggleOnTeam(setTeamB, teamB, item.id)}
+              >
+                <Text style={[styles.btnTxt, onB && styles.btnOnTxt]}>Team B</Text>
+              </TouchableOpacity>
+            </View>
+          );
+        }}
+        ListEmptyComponent={<Text>No users found</Text>}
+        style={{ marginTop: 4 }}
+      />
+
+      <TouchableOpacity style={styles.start} onPress={startMatch}>
+        <Text style={styles.startTxt}>Start Match</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 16, flex: 1, backgroundColor: 'white' },
-  h1: { fontSize: 22, fontWeight: '700', marginBottom: 8 },
-  h2: { fontSize: 16, fontWeight: '600', marginBottom: 6 },
-  search: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, padding: 10, marginBottom: 8 },
-  row: { flexDirection: 'row', gap: 12, flex: 1 },
-  col: { flex: 1 },
-  itemRow: { paddingVertical: 8, borderBottomWidth: 1, borderColor: '#eee', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  player: { fontSize: 14 },
-  actions: { flexDirection: 'row', gap: 8 },
-  btn: { paddingHorizontal: 8, paddingVertical: 6, backgroundColor: '#f2f2f2', borderRadius: 6 },
-  tag: { backgroundColor: '#f7f7f7', marginVertical: 4, padding: 8, borderRadius: 8 },
-  start: { marginTop: 18, backgroundColor: '#111', padding: 14, alignItems: 'center', borderRadius: 10 }
+  container: { flex: 1, padding: 16, backgroundColor: 'white' },
+  h1: { fontSize: 22, fontWeight: '800', marginBottom: 8 },
+  h2: { fontSize: 16, fontWeight: '700', marginTop: 8, marginBottom: 6 },
+
+  rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  selectedMeta: { color: '#666', fontWeight: '700' },
+
+  pill: { paddingVertical: 8, paddingHorizontal: 12, borderWidth: 1, borderColor: '#ddd', borderRadius: 20, marginRight: 8 },
+  pillActive: { backgroundColor: '#111', borderColor: '#111' },
+  pillTxt: { color: '#111', fontWeight: '700' },
+  pillTxtActive: { color: 'white' },
+
+  // Search
+  searchWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
+  searchInput: {
+    flex: 1,
+    borderWidth: 1, borderColor: '#ddd', borderRadius: 10,
+    paddingHorizontal: 12, paddingVertical: 8,
+  },
+  clearBtn: { paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#eee' },
+  clearTxt: { fontWeight: '800', color: '#111' },
+
+  userRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderColor: '#eee' },
+  btn: { borderWidth: 1, borderColor: '#ccc', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, marginLeft: 8, backgroundColor: 'white' },
+  btnOn: { backgroundColor: '#111', borderColor: '#111' },
+  btnTxt: { color: '#111', fontWeight: '800' },
+  btnOnTxt: { color: 'white' },
+
+  start: { marginTop: 16, backgroundColor: '#0a0', padding: 12, borderRadius: 10, alignItems: 'center' },
+  startTxt: { color: 'white', fontWeight: '800' }
 });

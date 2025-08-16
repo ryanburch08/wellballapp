@@ -1,0 +1,28 @@
+{
+  "cli": {
+    "version": ">= 3.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "preview": {
+      "ios": {
+        "image": "latest"
+      },
+      "android": {
+        "image": "latest"
+      },
+      "developmentClient": false,
+      "autoIncrement": true
+    },
+    "production": {
+      "ios": {
+        "image": "latest"
+      },
+      "android": {
+        "image": "latest"
+      },
+      "developmentClient": false,
+      "autoIncrement": true
+    }
+  }
+}

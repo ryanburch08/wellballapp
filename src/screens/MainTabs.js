@@ -5,8 +5,8 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth, db } from '../services/firebase';
 import { doc, getDoc } from 'firebase/firestore';
+import { ensureUserDoc } from '../services/userService';
 
-// FIXED imports: same-folder screens use "./"
 import HomeScreen from './HomeScreen';
 import EventsScreen from './EventsScreen';
 import MediaScreen from './MediaScreen';
@@ -16,27 +16,28 @@ import StaffDashboard from './StaffDashboard';
 const Tab = createBottomTabNavigator();
 
 export default function MainTabs() {
-  const [role, setRole] = useState(null);       // "player" | "staff" | "admin" | null while loading
   const [loading, setLoading] = useState(true);
+  const [role, setRole] = useState('player'); // default
 
   useEffect(() => {
-    // Keep role in sync with auth state
     const unsub = onAuthStateChanged(auth, async (user) => {
       try {
-        if (user) {
-          const userDoc = await getDoc(doc(db, 'users', user.uid));
-          if (userDoc.exists()) {
-            setRole(userDoc.data().role || 'player');
-          } else {
-            // No /users doc yet, default to player
-            setRole('player');
-          }
-        } else {
-          // Not signed in
+        if (!user) {
           setRole('player');
+          setLoading(false);
+          return;
         }
+
+        // Ensure user doc exists (creates with a sensible default role)
+        const ensured = await ensureUserDoc(user);
+
+        // Read role from Firestore
+        const userDoc = await getDoc(doc(db, 'users', user.uid));
+        const data = userDoc.exists() ? userDoc.data() : ensured || {};
+        setRole(data.role || 'player');
       } catch (e) {
-        console.warn('Failed to load role', e);
+        console.warn('Role load failed:', e);
+        // fallback: keep non-staff UI
         setRole('player');
       } finally {
         setLoading(false);
@@ -47,7 +48,7 @@ export default function MainTabs() {
 
   if (loading) {
     return (
-      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      <View style={{ flex:1, alignItems:'center', justifyContent:'center' }}>
         <ActivityIndicator />
       </View>
     );
