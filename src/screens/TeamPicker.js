@@ -1,6 +1,6 @@
 // src/screens/TeamPicker.js
-import React, { useEffect, useMemo, useState } from 'react';
-import { View, Text, TouchableOpacity, ActivityIndicator, FlatList, Alert, StyleSheet, TextInput } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { View, Text, TouchableOpacity, ActivityIndicator, FlatList, Alert, StyleSheet, TextInput, Switch } from 'react-native';
 import { db } from '../services/firebase';
 import { collection, getDocs, doc, getDoc } from 'firebase/firestore';
 import { createGame } from '../services/gameService';
@@ -14,8 +14,10 @@ export default function TeamPicker({ navigation, route }) {
   const [teamB, setTeamB] = useState([]);
   const [selectedSequenceId, setSelectedSequenceId] = useState(null);
 
-  // NEW: search state
-  const [queryStr, setQueryStr] = useState('');
+  // NEW: freestyle mode
+  const [isFreestyle, setIsFreestyle] = useState(false);
+  const [fsTarget, setFsTarget] = useState('10');
+  const [fsPoints, setFsPoints] = useState('1');
 
   useEffect(() => {
     const load = async () => {
@@ -38,7 +40,6 @@ export default function TeamPicker({ navigation, route }) {
     load();
   }, []);
 
-  // Quick toggle helpers (unchanged)
   const toggleOnTeam = (teamSetter, team, uid) => {
     if (team.includes(uid)) {
       teamSetter(team.filter(id => id !== uid));
@@ -49,23 +50,40 @@ export default function TeamPicker({ navigation, route }) {
 
   const startMatch = async () => {
     try {
-      if (!selectedSequenceId) return Alert.alert('Pick a sequence');
       if (teamA.length === 0 || teamB.length === 0) return Alert.alert('Pick at least one player per team');
 
-      // Load the chosen sequence to get its ordered challengeIds
-      const seqSnap = await getDoc(doc(db, 'sequences', selectedSequenceId));
-      if (!seqSnap.exists()) throw new Error('Sequence not found');
-      const seq = seqSnap.data();
-      const sequenceChallengeIds = Array.isArray(seq.challengeIds) ? seq.challengeIds : [];
+      let sequenceChallengeIds = [];
+      let sequenceId = null;
+      let mode = 'sequence';
+      let freestyle = undefined;
+
+      if (isFreestyle) {
+        mode = 'freestyle';
+        freestyle = {
+          targetScore: Number(fsTarget) || 0,
+          pointsForWin: Number(fsPoints) || 0,
+        };
+      } else {
+        if (!selectedSequenceId) return Alert.alert('Pick a sequence (or enable Freestyle)');
+        sequenceId = selectedSequenceId;
+
+        // Load the chosen sequence to get its ordered challengeIds
+        const seqSnap = await getDoc(doc(db, 'sequences', selectedSequenceId));
+        if (!seqSnap.exists()) throw new Error('Sequence not found');
+        const seq = seqSnap.data();
+        sequenceChallengeIds = Array.isArray(seq.challengeIds) ? seq.challengeIds : [];
+      }
 
       const gameId = await createGame({
         teamAIds: teamA,
         teamBIds: teamB,
-        sequenceId: selectedSequenceId,
+        sequenceId,
         sequenceChallengeIds,
         clockSeconds: 90,
         secondaryKeeper: null,
         eventId,
+        mode,
+        freestyle,
       });
 
       navigation.replace('StatEntryScreen', { gameId });
@@ -74,95 +92,92 @@ export default function TeamPicker({ navigation, route }) {
     }
   };
 
-  // NEW: filtered users based on query string
-  const filteredUsers = useMemo(() => {
-    const q = queryStr.trim().toLowerCase();
-    if (!q) return users;
-    return users.filter(u => {
-      const name = String(u.displayName || '').toLowerCase();
-      const email = String(u.email || '').toLowerCase();
-      const id = String(u.id || '').toLowerCase();
-      return name.includes(q) || email.includes(q) || id.includes(q);
-    });
-  }, [users, queryStr]);
-
   if (loading) return <ActivityIndicator style={{ marginTop: 40 }} />;
 
   return (
     <View style={styles.container}>
       <Text style={styles.h1}>Team Picker</Text>
 
-      <Text style={styles.h2}>Sequence</Text>
-      <FlatList
-        data={sequences}
-        keyExtractor={s => s.id}
-        horizontal
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            style={[styles.pill, selectedSequenceId === item.id && styles.pillActive]}
-            onPress={() => setSelectedSequenceId(item.id)}
-          >
-            <Text style={[styles.pillTxt, selectedSequenceId === item.id && styles.pillTxtActive]}>
-              {item.name || item.id}
-            </Text>
-          </TouchableOpacity>
-        )}
-        ListEmptyComponent={<Text>No sequences</Text>}
-        style={{ marginBottom: 12 }}
-        showsHorizontalScrollIndicator={false}
-      />
-
-      <View style={styles.rowBetween}>
-        <Text style={styles.h2}>Players</Text>
-        {/* quick glance of selected counts */}
-        <Text style={styles.selectedMeta}>A: {teamA.length} • B: {teamB.length}</Text>
+      {/* NEW: Freestyle toggle */}
+      <View style={styles.row}>
+        <Text style={styles.h2}>Freestyle Mode</Text>
+        <Switch value={isFreestyle} onValueChange={setIsFreestyle} />
       </View>
 
-      {/* NEW: search box */}
-      <View style={styles.searchWrap}>
-        <TextInput
-          placeholder="Search players by name, email, or ID"
-          value={queryStr}
-          onChangeText={setQueryStr}
-          style={styles.searchInput}
-          autoCorrect={false}
-          autoCapitalize="none"
-        />
-        {queryStr.length > 0 && (
-          <TouchableOpacity onPress={() => setQueryStr('')} style={styles.clearBtn}>
-            <Text style={styles.clearTxt}>Clear</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      <FlatList
-        data={filteredUsers}
-        keyExtractor={u => u.id}
-        keyboardShouldPersistTaps="handled"
-        renderItem={({ item }) => {
-          const label = item.displayName || item.email || item.id;
-          const onA = teamA.includes(item.id);
-          const onB = teamB.includes(item.id);
-          return (
-            <View style={styles.userRow}>
-              <Text style={{ flex: 1 }} numberOfLines={1}>{label}</Text>
+      {!isFreestyle ? (
+        <>
+          <Text style={styles.h2}>Sequence</Text>
+          <FlatList
+            data={sequences}
+            keyExtractor={s => s.id}
+            horizontal
+            renderItem={({ item }) => (
               <TouchableOpacity
-                style={[styles.btn, onA && styles.btnOn]}
-                onPress={() => toggleOnTeam(setTeamA, teamA, item.id)}
+                style={[styles.pill, selectedSequenceId === item.id && styles.pillActive]}
+                onPress={() => setSelectedSequenceId(item.id)}
               >
-                <Text style={[styles.btnTxt, onA && styles.btnOnTxt]}>Team A</Text>
+                <Text style={[styles.pillTxt, selectedSequenceId === item.id && { color: 'white' }]}>
+                  {item.name || item.id}
+                </Text>
               </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.btn, onB && styles.btnOn]}
-                onPress={() => toggleOnTeam(setTeamB, teamB, item.id)}
-              >
-                <Text style={[styles.btnTxt, onB && styles.btnOnTxt]}>Team B</Text>
-              </TouchableOpacity>
+            )}
+            ListEmptyComponent={<Text>No sequences</Text>}
+            style={{ marginBottom: 12 }}
+          />
+        </>
+      ) : (
+        <View style={styles.fsCard}>
+          <Text style={styles.h2}>Freestyle Settings</Text>
+          <View style={[styles.row, { gap: 8 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>Target Score</Text>
+              <TextInput
+                value={fsTarget}
+                onChangeText={setFsTarget}
+                keyboardType="numeric"
+                style={styles.input}
+                placeholder="e.g. 10"
+              />
             </View>
-          );
-        }}
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>Points for Win</Text>
+              <TextInput
+                value={fsPoints}
+                onChangeText={setFsPoints}
+                keyboardType="numeric"
+                style={styles.input}
+                placeholder="e.g. 1"
+              />
+            </View>
+          </View>
+          <Text style={{ color: '#666', marginTop: 4 }}>
+            These can be changed mid-game in the tracker screen.
+          </Text>
+        </View>
+      )}
+
+      <Text style={styles.h2}>Players</Text>
+      <FlatList
+        data={users}
+        keyExtractor={u => u.id}
+        renderItem={({ item }) => (
+          <View style={styles.userRow}>
+            <Text style={{ flex: 1 }}>{item.displayName || item.email || item.id}</Text>
+            <TouchableOpacity
+              style={[styles.btn, teamA.includes(item.id) && styles.btnOn]}
+              onPress={() => toggleOnTeam(setTeamA, teamA, item.id)}
+            >
+              <Text style={[styles.btnTxt, teamA.includes(item.id) && { color: 'white' }]}>Team A</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.btn, teamB.includes(item.id) && styles.btnOn]}
+              onPress={() => toggleOnTeam(setTeamB, teamB, item.id)}
+            >
+              <Text style={[styles.btnTxt, teamB.includes(item.id) && { color: 'white' }]}>Team B</Text>
+            </TouchableOpacity>
+          </View>
+        )}
         ListEmptyComponent={<Text>No users found</Text>}
-        style={{ marginTop: 4 }}
       />
 
       <TouchableOpacity style={styles.start} onPress={startMatch}>
@@ -174,32 +189,23 @@ export default function TeamPicker({ navigation, route }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 16, backgroundColor: 'white' },
+  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
   h1: { fontSize: 22, fontWeight: '800', marginBottom: 8 },
   h2: { fontSize: 16, fontWeight: '700', marginTop: 8, marginBottom: 6 },
-
-  rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  selectedMeta: { color: '#666', fontWeight: '700' },
+  label: { fontSize: 12, fontWeight: '700', marginBottom: 4, color: '#333' },
 
   pill: { paddingVertical: 8, paddingHorizontal: 12, borderWidth: 1, borderColor: '#ddd', borderRadius: 20, marginRight: 8 },
-  pillActive: { backgroundColor: '#111', borderColor: '#111' },
-  pillTxt: { color: '#111', fontWeight: '700' },
-  pillTxtActive: { color: 'white' },
+  pillActive: { backgroundColor: '#111' },
+  pillTxt: { color: '#111' },
 
-  // Search
-  searchWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
-  searchInput: {
-    flex: 1,
-    borderWidth: 1, borderColor: '#ddd', borderRadius: 10,
-    paddingHorizontal: 12, paddingVertical: 8,
-  },
-  clearBtn: { paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#eee' },
-  clearTxt: { fontWeight: '800', color: '#111' },
+  fsCard: { borderWidth: 1, borderColor: '#eee', borderRadius: 10, padding: 10, marginBottom: 10, backgroundColor: '#fafafa' },
 
   userRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderColor: '#eee' },
-  btn: { borderWidth: 1, borderColor: '#ccc', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, marginLeft: 8, backgroundColor: 'white' },
-  btnOn: { backgroundColor: '#111', borderColor: '#111' },
-  btnTxt: { color: '#111', fontWeight: '800' },
-  btnOnTxt: { color: 'white' },
+  btn: { borderWidth: 1, borderColor: '#ccc', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, marginLeft: 8 },
+  btnOn: { backgroundColor: '#111' },
+  btnTxt: { color: '#111' },
+
+  input: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8 },
 
   start: { marginTop: 16, backgroundColor: '#0a0', padding: 12, borderRadius: 10, alignItems: 'center' },
   startTxt: { color: 'white', fontWeight: '800' }

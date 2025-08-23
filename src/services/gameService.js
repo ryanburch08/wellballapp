@@ -1,5 +1,5 @@
 // src/services/gameService.js
-// Minimal game service for MVP + two-tracker flow
+// Minimal game service for MVP + two-tracker + Freestyle mode + specialty lights
 // Assumes src/services/firebase.js exports { auth, db }
 
 /* ------------------------------------------------------------------ */
@@ -7,19 +7,34 @@
 games/{gameId} = {
   createdBy, roles: { main, secondary|null },
   teamAIds: [uid], teamBIds: [uid],
-  sequenceId, sequenceChallengeIds: [challengeId, ...],
+
+  // Mode & challenge flow
+  mode: 'sequence' | 'freestyle',
+  sequenceId: string|null,
+  sequenceChallengeIds: [challengeId, ...],  // used when mode==='sequence'
   currentChallengeIndex: 0,
+  freestyle: { targetScore: number, pointsForWin: number } | null, // used when mode==='freestyle'
+
+  // Scores
   matchScore: { A:0, B:0 },
   challengeScore: { A:0, B:0 },
-  challengeWon: null | { team, atIndex, pointsForWin, scoreA, scoreB, winLogId?, ts }
+  challengeWon: null | { team, atIndex, pointsForWin, scoreA, scoreB, winLogId?, ts },
 
-  // Bonus mode flag used by UI to switch buttons and routing
+  // Specialty usage (resets every challenge)
+  specials: {
+    A: { moneyUsed: false, gcUsed: false },
+    B: { moneyUsed: false, gcUsed: false },
+  },
+
+  // Bonus round toggle
   bonusActive: false,
 
+  // Clock
   clockSeconds: 90,
   clockRunning: false,
   lastStartAt: Timestamp|null,
 
+  // Two-tracker presence & locks
   trackerLocks: { A: { uid, updatedAt } | null, B: { uid, updatedAt } | null },
 
   status: 'lobby' | 'live' | 'ended',
@@ -27,7 +42,7 @@ games/{gameId} = {
 }
 games/{gameId}/logs/{logId}   // shot actions + meta
 games/{gameId}/trackers/{uid} // presence: { team, role, lastSeen }
-/* ------------------------------------------------------------------ */
+--------------------------------------------------------------------- */
 
 import {
   collection, doc, getDoc, getDocs, onSnapshot, query, serverTimestamp,
@@ -67,7 +82,6 @@ export const heartbeat = async (gameId) => {
 export const joinAsTracker = async (gameId, team) => {
   const uid = auth.currentUser?.uid;
   if (!uid) throw new Error('Not signed in');
-  if (!['A','B'].includes(team)) throw new Error('Invalid team');
   const ref = doc(db, 'games', gameId, 'trackers', uid);
   await setDoc(ref, { team, lastSeen: serverTimestamp() }, { merge: true });
 };
@@ -134,25 +148,42 @@ export const listenMyTrackerAssignment = (gameId, cb) => {
 export const createGame = async ({
   teamAIds,
   teamBIds,
-  sequenceId,
-  sequenceChallengeIds,
+  sequenceId = null,
+  sequenceChallengeIds = [],
   clockSeconds = 90,
   secondaryKeeper = null,
   eventId = null,
+  // NEW:
+  mode = 'sequence',                 // 'sequence' | 'freestyle'
+  freestyle = null,                  // { targetScore, pointsForWin } when mode==='freestyle'
 }) => {
   const creator = auth.currentUser?.uid || 'unknown';
   const ref = doc(collection(db, 'games'));
   await setDoc(ref, {
     createdBy: creator,
     roles: { main: creator, secondary: secondaryKeeper },
+
     teamAIds,
     teamBIds,
+
+    mode,
     sequenceId,
     sequenceChallengeIds,
     currentChallengeIndex: 0,
+    freestyle: mode === 'freestyle'
+      ? {
+          targetScore: Number(freestyle?.targetScore ?? 0) || 0,
+          pointsForWin: Number(freestyle?.pointsForWin ?? 0) || 0,
+        }
+      : null,
+
     matchScore: { A: 0, B: 0 },
     challengeScore: { A: 0, B: 0 },
     challengeWon: null,
+
+    // specialty lights start fresh
+    specials: { A: { moneyUsed: false, gcUsed: false }, B: { moneyUsed: false, gcUsed: false } },
+
     bonusActive: false,
 
     clockSeconds,
@@ -171,8 +202,8 @@ export const listenToGame = (gameId, cb) =>
   onSnapshot(doc(db, 'games', gameId), snap => cb(snap.exists() ? ({ id: snap.id, ...snap.data() }) : null));
 
 export const listenToLogs = (gameId, cb, team = null) => {
-  let qy = query(collection(db, 'games', gameId, 'logs'), orderBy('ts', 'desc'), limit(100));
-  if (team) qy = query(collection(db, 'games', gameId, 'logs'), where('team', '==', team), orderBy('ts', 'desc'), limit(100));
+  let qy = query(collection(db, 'games', gameId, 'logs'), orderBy('ts', 'desc'), limit(200));
+  if (team) qy = query(collection(db, 'games', gameId, 'logs'), where('team', '==', team), orderBy('ts', 'desc'), limit(200));
   return onSnapshot(qy, snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
 };
 
@@ -190,6 +221,25 @@ const playerTeamKey = (game, playerId) => {
   if (game.teamAIds?.includes(playerId)) return 'A';
   if (game.teamBIds?.includes(playerId)) return 'B';
   return null;
+};
+
+const getCurrentTargetAndPfw = async (tx, game) => {
+  // If bonus shot, caller won't check target.
+  if (game.mode === 'freestyle') {
+    const target = Number(game?.freestyle?.targetScore ?? 0) || 0;
+    const pointsForWin = Number(game?.freestyle?.pointsForWin ?? 0) || 0;
+    return { target, pointsForWin };
+  }
+  // sequence mode: read challenge doc for current challenge
+  const currentChallengeId = game.sequenceChallengeIds?.[game.currentChallengeIndex];
+  if (!currentChallengeId) return { target: 0, pointsForWin: 0 };
+  const challSnap = await tx.get(doc(db, 'challenges', currentChallengeId));
+  if (!challSnap.exists()) return { target: 0, pointsForWin: 0 };
+  const chall = challSnap.data() || {};
+  return {
+    target: Number(chall?.targetScore ?? 0) || 0,
+    pointsForWin: Number(chall?.pointsForWin ?? 0) || 0,
+  };
 };
 
 /* ========================= Shots & Undo ========================= */
@@ -225,19 +275,22 @@ export const logShot = async (gameId, { playerId, shotType, made, moneyball = fa
     const pts = Number(shotPoints({ shotType, made, moneyball })) || 0;
     const isBonusShot = shotType === 'bonus';
 
-    // Pre-read challenge meta if this could win
+    // Enforce specialty 1x/ challenge (we count usage on attempt)
+    const specials = game.specials || { A: { moneyUsed: false, gcUsed: false }, B: { moneyUsed: false, gcUsed: false } };
+    if (moneyball && (specials?.[teamKey]?.moneyUsed === true)) {
+      throw new Error(`Team ${teamKey} has already used Moneyball this challenge.`);
+    }
+    if (shotType === 'gamechanger' && (specials?.[teamKey]?.gcUsed === true)) {
+      throw new Error(`Team ${teamKey} has already used Gamechanger this challenge.`);
+    }
+
+    // Pre-read challenge meta if this could win (non-bonus made shots)
     let target = 0;
     let pointsForWin = 0;
     if (!isBonusShot && made) {
-      const currentChallengeId = game.sequenceChallengeIds?.[game.currentChallengeIndex];
-      if (currentChallengeId) {
-        const challSnap = await tx.get(doc(db, 'challenges', currentChallengeId));
-        if (challSnap.exists()) {
-          const chall = challSnap.data();
-          target = Number(chall?.targetScore ?? 0) || 0;
-          pointsForWin = Number(chall?.pointsForWin ?? 1) || 0;
-        }
-      }
+      const tpfw = await getCurrentTargetAndPfw(tx, game);
+      target = tpfw.target;
+      pointsForWin = tpfw.pointsForWin;
     }
 
     const curMatch = (k) => Number(game.matchScore?.[k] ?? 0) || 0;
@@ -252,6 +305,14 @@ export const logShot = async (gameId, { playerId, shotType, made, moneyball = fa
         // NORMAL → CHALLENGE
         updates[`challengeScore.${teamKey}`] = curChal(teamKey) + pts;
       }
+    }
+
+    // Mark specialty usage when attempted
+    if (moneyball) {
+      updates[`specials.${teamKey}.moneyUsed`] = true;
+    }
+    if (shotType === 'gamechanger') {
+      updates[`specials.${teamKey}.gcUsed`] = true;
     }
 
     // Challenge win check only for non-bonus made shots
@@ -271,7 +332,7 @@ export const logShot = async (gameId, { playerId, shotType, made, moneyball = fa
           scoreA: teamKey === 'A' ? newChallengeScore : curChal('A'),
           scoreB: teamKey === 'B' ? newChallengeScore : curChal('B'),
           pointsForWin,
-          winLogId: winLogRef.id,
+          winLogId: winLogRef.id, // <— store the win-log id for undo
           ts: serverTimestamp(),
         };
         updates['challengeWon'] = wonNow;
@@ -309,6 +370,31 @@ export const undoLastActionForPlayer = async () => {
   throw new Error('For MVP, pass a specific logId to undo using deleteLogAndReverse');
 };
 
+// Best-effort recompute specialty usage flags for the current challenge
+const recomputeSpecialsForChallenge = async (gameId, challengeIndex) => {
+  try {
+    const logsCol = collection(db, 'games', gameId, 'logs');
+    const qy = query(
+      logsCol,
+      where('challengeIndex', '==', Number(challengeIndex)),
+      orderBy('ts', 'asc'),
+      limit(400)
+    );
+    const snap = await getDocs(qy);
+    const flags = { A: { moneyUsed: false, gcUsed: false }, B: { moneyUsed: false, gcUsed: false } };
+    snap.forEach(d => {
+      const l = d.data();
+      if (l?.team === 'A' || l?.team === 'B') {
+        if (l.moneyball) flags[l.team].moneyUsed = true;
+        if (l.shotType === 'gamechanger') flags[l.team].gcUsed = true;
+      }
+    });
+    await updateDoc(doc(db, 'games', gameId), { specials: flags });
+  } catch (e) {
+    console.warn('recomputeSpecialsForChallenge failed:', e?.message || e);
+  }
+};
+
 // Delete a log and reverse its scoring (also reverts wins + removes win log)
 export const deleteLogAndReverse = async (gameId, log) => {
   const gameRef = doc(db, 'games', gameId);
@@ -317,6 +403,7 @@ export const deleteLogAndReverse = async (gameId, log) => {
   let needFallbackWinCleanup = false;
   let fallbackTeam = null;
   let fallbackIndex = null;
+  let challengeIndexForSpecials = null;
 
   await runTransaction(db, async (tx) => {
     const gameSnap = await tx.get(gameRef);
@@ -325,6 +412,7 @@ export const deleteLogAndReverse = async (gameId, log) => {
 
     const { shotType, made, moneyball, team, challengeIndex } = log;
     const pts = Number(shotPoints({ shotType, made, moneyball })) || 0;
+    challengeIndexForSpecials = Number(challengeIndex ?? 0);
 
     const curMatch = (k) => Number(game.matchScore?.[k] ?? 0) || 0;
     const curChal  = (k) => Number(game.challengeScore?.[k] ?? 0) || 0;
@@ -390,26 +478,42 @@ export const deleteLogAndReverse = async (gameId, log) => {
       console.warn('Best-effort win-log cleanup failed (safe to ignore):', e?.message || e);
     }
   }
+
+  // Recompute specialty usage flags after deletion (best effort)
+  if (challengeIndexForSpecials != null) {
+    await recomputeSpecialsForChallenge(gameId, challengeIndexForSpecials);
+  }
 };
 
 /* ========================= Bonus / End / Clock ========================= */
 
-// Simple flag setter for bonus mode
-export const toggleBonusRound = async (gameId, on) =>
-  updateDoc(doc(db, 'games', gameId), { bonusActive: !!on });
-
-// High-level helpers used by the UI:
-// startBonusMode: stop clock, set 3:00, mark bonusActive true. Do not auto-start.
 export const startBonusMode = async (gameId) => {
-  await stopClock(gameId);
-  await setClockSeconds(gameId, 180);
-  await toggleBonusRound(gameId, true);
+  // Stop the clock, set to 180s, flip bonusActive true (do NOT start)
+  const gameRef = doc(db, 'games', gameId);
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(gameRef);
+    if (!snap.exists()) throw new Error('Game not found');
+    const g = snap.data() || {};
+    // compute remaining (stopClock logic inline to avoid two transactions)
+    const base = Number(g.clockSeconds || 0);
+    const last = g.lastStartAt;
+    let remaining = base;
+    if (g.clockRunning && last) {
+      const lastMs = last.toMillis ? last.toMillis() : Date.parse(last);
+      const elapsed = Math.max(0, Math.floor((Date.now() - lastMs) / 1000));
+      remaining = Math.max(0, base - elapsed);
+    }
+    tx.update(gameRef, {
+      clockSeconds: 180,
+      clockRunning: false,
+      lastStartAt: null,
+      bonusActive: true,
+    });
+  });
 };
 
-// endBonusMode: simply flip the flag and leave clock as-is
-export const endBonusMode = async (gameId) => {
-  await toggleBonusRound(gameId, false);
-};
+export const endBonusMode = async (gameId) =>
+  updateDoc(doc(db, 'games', gameId), { bonusActive: false });
 
 export const endGame = async (gameId) =>
   updateDoc(doc(db, 'games', gameId), { status: 'ended' });
@@ -461,9 +565,18 @@ export const resetClockSeconds = async (gameId, seconds) => {
   });
 };
 
+/* ========================= Freestyle Helpers ========================= */
+
+// Update freestyle params for the current challenge (used when mode==='freestyle')
+export const setFreestyleParams = async (gameId, { targetScore, pointsForWin }) => {
+  const t = Math.max(0, Number(targetScore) || 0);
+  const p = Math.max(0, Number(pointsForWin) || 0);
+  await updateDoc(doc(db, 'games', gameId), { freestyle: { targetScore: t, pointsForWin: p } });
+};
+
 /* ========================= Challenge Progression ========================= */
 
-// Advance to the next challenge; clears current challenge scores and win
+// Advance to the next challenge; clears current challenge scores, win, specialties
 export const advanceToNextChallenge = async (gameId) => {
   const gameRef = doc(db, 'games', gameId);
   await runTransaction(db, async (tx) => {
@@ -472,11 +585,21 @@ export const advanceToNextChallenge = async (gameId) => {
     const g = snap.data() || {};
     const cur = Number(g.currentChallengeIndex ?? 0);
     const total = Number(g.sequenceChallengeIds?.length ?? 1);
-    const next = Math.min(cur + 1, Math.max(0, total - 1));
-    tx.update(gameRef, {
+    // In freestyle we can still increment the index, it just groups logs.
+    const next = g.mode === 'sequence'
+      ? Math.min(cur + 1, Math.max(0, total - 1))
+      : cur + 1;
+
+    const updates = {
       currentChallengeIndex: next,
       challengeScore: { A: 0, B: 0 },
       challengeWon: null,
-    });
+      // reset specialty usage for new challenge (lights go green again)
+      specials: { A: { moneyUsed: false, gcUsed: false }, B: { moneyUsed: false, gcUsed: false } },
+      // leaving bonusActive alone is okay; we can also auto-end it if you prefer:
+      bonusActive: false,
+    };
+
+    tx.update(gameRef, updates);
   });
 };

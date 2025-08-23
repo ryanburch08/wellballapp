@@ -2,24 +2,18 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, Alert, TextInput, Switch } from 'react-native';
 import { db, auth } from '../services/firebase';
-import { doc, onSnapshot, collection, query, orderBy, onSnapshot as onSnapCol } from 'firebase/firestore';
+import { doc, onSnapshot, collection, query, orderBy, onSnapshot as onSnapCol, updateDoc } from 'firebase/firestore';
 
 import {
-  // shots + undo + progression
   logShot,
   deleteLogAndReverse,
   advanceToNextChallenge,
-  // clock helpers
   setClockSeconds,
   startClock,
   stopClock,
   resetClockSeconds,
-  // bonus helpers (new)
   startBonusMode,
   endBonusMode,
-  // end game
-  endGame,
-  // two-tracker presence & locks
   listenMyTrackerAssignment,
   listenTrackers,
   heartbeat,
@@ -27,35 +21,79 @@ import {
   joinAsTracker,
   tryClaimTeam,
   setTeamLock,
+  endGame,
 } from '../services/gameService';
+
+/* -------- helpers (no hooks) -------- */
+const computeDisplayedSeconds = (clockSeconds, running, lastStartAt) => {
+  const base = Number(clockSeconds || 0);
+  if (!running || !lastStartAt) return base;
+  const lastMs = lastStartAt.toMillis ? lastStartAt.toMillis() : Date.parse(lastStartAt);
+  const elapsed = Math.max(0, Math.floor((Date.now() - lastMs) / 1000));
+  return Math.max(0, base - elapsed);
+};
+const formatClock = (sec) => {
+  if (!Number.isFinite(sec)) return '--:--';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+};
+const buildLastByPlayer = (logs) => {
+  const map = {};
+  for (const l of logs) {
+    if (l?.playerId && typeof l.made === 'boolean' && !map[l.playerId]) {
+      map[l.playerId] = l; // newest->oldest
+    }
+  }
+  return map;
+};
 
 export default function StatEntryScreen({ route, navigation }) {
   const { gameId } = route.params || {};
   const uid = auth.currentUser?.uid;
 
+  // ------ state/hooks (keep order stable) ------
   const [game, setGame] = useState(null);
   const [logs, setLogs] = useState([]);
   const [moneyballArmed, setMoneyballArmed] = useState(false);
 
-  // live clock tick
   const [tick, setTick] = useState(0);
   const [newClock, setNewClock] = useState('');
 
-  // presence
-  const [myTrack, setMyTrack] = useState(null);      // {team?: 'A'|'B', lastSeen?}
-  const [trackers, setTrackers] = useState([]);      // [{id: uid, team, lastSeen}]
+  const [myTrack, setMyTrack] = useState(null);
+  const [trackers, setTrackers] = useState([]);
+
+  const [assignOpen, setAssignOpen] = useState(true);
+
+  // freestyle inputs
+  const [fsTarget, setFsTarget] = useState('');
+  const [fsWorth, setFsWorth] = useState('');
 
   // subscribe to game + logs
   useEffect(() => {
     if (!gameId) return;
     const unsubGame = onSnapshot(doc(db, 'games', gameId), snap => {
-      if (snap.exists()) setGame({ id: snap.id, ...snap.data() });
+      const g = snap.exists() ? { id: snap.id, ...snap.data() } : null;
+      setGame(g);
+
+      // initialize freestyle inputs from server if empty (avoid stomping while typing)
+      if (g) {
+        if (fsTarget === '') {
+          const t = Number(g.freestyleTarget);
+          setFsTarget(Number.isFinite(t) ? String(t) : '');
+        }
+        if (fsWorth === '') {
+          const w = Number(g.freestyleWorth);
+          setFsWorth(Number.isFinite(w) ? String(w) : '');
+        }
+      }
     });
+
     const q = query(collection(db, 'games', gameId, 'logs'), orderBy('ts', 'desc'));
     const unsubLogs = onSnapCol(q, s => setLogs(s.docs.map(d => ({ id: d.id, ...d.data() }))));
 
     return () => { unsubGame && unsubGame(); unsubLogs && unsubLogs(); };
-  }, [gameId]);
+  }, [gameId, fsTarget, fsWorth]);
 
   // subscribe to presence
   useEffect(() => {
@@ -66,7 +104,7 @@ export default function StatEntryScreen({ route, navigation }) {
     return () => { offMine && offMine(); offAll && offAll(); clearInterval(hb); leaveTracking(gameId); };
   }, [gameId]);
 
-  // re-render once per second while clock is running
+  // live tick for clock
   useEffect(() => {
     if (!game?.clockRunning || !game?.lastStartAt) return;
     const id = setInterval(() => setTick(t => (t + 1) % 60), 1000);
@@ -91,24 +129,31 @@ export default function StatEntryScreen({ route, navigation }) {
     return null;
   };
 
-  // Only allow taps for my assigned team (main can tap both)
   const canTap = (playerId) => {
     if (!game) return false;
-    if (game.status === 'ended') return false;
-    if (game.challengeWon) return false; // block until Next Challenge
+    if (game.challengeWon) return false;
     const teamKey = playerTeamKey(playerId);
     if (!teamKey) return false;
     return isMain || (myTrack?.team === teamKey);
   };
 
-  // -------- Bonus state (aligned on bonusActive, fallback to legacy) --------
   const bonusActive = !!(game?.bonusActive ?? game?.bonusRound ?? false);
 
-  // Record shot
+  // robust freestyle detection
+  const isFreestyle = useMemo(() => {
+    if (!game) return false;
+    if (game.mode === 'freestyle' || game.freestyle === true) return true;
+    if (game.sequenceId === 'freestyle') return true;
+    const arr = game.sequenceChallengeIds;
+    if (Array.isArray(arr) && arr.length === 0) return true;
+    return false;
+  }, [game]);
+
+  // derived: last shot by player
+  const lastByPlayer = useMemo(() => buildLastByPlayer(logs), [logs]);
+
+  // actions
   const record = async (playerId, shotType, made) => {
-    if (game?.status === 'ended') {
-      return Alert.alert('Game ended', 'This game is completed. No further stats can be recorded.');
-    }
     if (game?.challengeWon) {
       return Alert.alert('Challenge complete', 'Tap “Next Challenge” to continue.');
     }
@@ -124,10 +169,8 @@ export default function StatEntryScreen({ route, navigation }) {
     }
   };
 
-  // Undo last attempt (uses most recent attempt in logs)
   const undoLast = async () => {
     try {
-      if (game?.status === 'ended') return Alert.alert('Game ended', 'Cannot undo after the game has ended.');
       const last = logs.find(l => typeof l.made !== 'undefined');
       if (!last) return Alert.alert('Nothing to undo');
       await deleteLogAndReverse(gameId, last);
@@ -138,7 +181,6 @@ export default function StatEntryScreen({ route, navigation }) {
 
   const doAdvance = async () => {
     try {
-      if (game?.status === 'ended') return Alert.alert('Game ended', 'This game is completed.');
       await advanceToNextChallenge(gameId);
     } catch (e) {
       Alert.alert('Advance failed', e.message);
@@ -156,20 +198,18 @@ export default function StatEntryScreen({ route, navigation }) {
     }
   };
 
-  // Non-main join helpers
   const canJoinA = !lockA || lockA === uid;
   const canJoinB = !lockB || lockB === uid;
 
   const joinTeam = async (team) => {
     try {
-      await joinAsTracker(gameId, team);  // presence preference
-      await tryClaimTeam(gameId, team);   // attempt to lock
+      await joinAsTracker(gameId, team);
+      await tryClaimTeam(gameId, team);
     } catch (e) {
       Alert.alert('Assign failed', e.message);
     }
   };
 
-  // Main assign helpers
   const assignTeam = async (team, toUid) => {
     try {
       await setTeamLock(gameId, team, toUid);
@@ -185,18 +225,15 @@ export default function StatEntryScreen({ route, navigation }) {
     }
   };
 
-  // -------- Bonus Round toggle + behavior (using gameService helpers) --------
+  // bonus on/off
   const startBonusRound = async () => {
     try {
-      if (game?.status === 'ended') return Alert.alert('Game ended', 'This game is completed.');
-      // Stop clock, set to 180, mark bonusActive true — do NOT auto-start
       await startBonusMode(gameId);
       if (moneyballArmed) setMoneyballArmed(false);
     } catch (e) {
       Alert.alert('Bonus error', e.message);
     }
   };
-
   const endBonusRound = async () => {
     try {
       await endBonusMode(gameId);
@@ -204,126 +241,73 @@ export default function StatEntryScreen({ route, navigation }) {
       Alert.alert('Bonus error', e.message);
     }
   };
-
   const toggleBonus = async (val) => {
-    if (!isMain) return; // only main can toggle
+    if (!isMain) return;
     if (val) await startBonusRound();
     else await endBonusRound();
   };
 
-  // -------- End Game flow --------
-  const onEndGame = () => {
-    if (!isMain) return;
-    Alert.alert(
-      'End game?',
-      'This will mark the game as completed. You can still view the box score, but no further stats can be recorded.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'End Game',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await endGame(gameId);
-              navigation.navigate('BoxScoreScreen', { gameId, fromEnded: true });
-            } catch (e) {
-              Alert.alert('End failed', e?.message || String(e));
-            }
-          }
-        }
-      ]
-    );
+  // freestyle setters
+  const applyFreestyle = async () => {
+    try {
+      const target = Math.max(0, Number(fsTarget) || 0);
+      const worth  = Math.max(0, Number(fsWorth) || 0);
+      await updateDoc(doc(db, 'games', gameId), {
+        freestyleTarget: target,
+        freestyleWorth: worth,
+      });
+      Alert.alert('Freestyle updated', `Target: ${target} • Worth: ${worth}`);
+    } catch (e) {
+      Alert.alert('Update failed', e.message);
+    }
   };
 
-  if (!game) return <View style={styles.center}><Text>Loading game...</Text></View>;
+  // end game -> status ended + navigate to box score
+  const endMatchNow = async () => {
+    try {
+      await endGame(gameId);
+      navigation.replace('BoxScoreScreen', { gameId, fromEnded: true });
+    } catch (e) {
+      Alert.alert('End match failed', e.message);
+    }
+  };
+
+  // ----- after hooks -----
+  if (!game) {
+    return (
+      <View style={styles.center}>
+        <Text>Loading game...</Text>
+      </View>
+    );
+  }
 
   const aCh = Number(game.challengeScore?.A ?? 0) || 0;
   const bCh = Number(game.challengeScore?.B ?? 0) || 0;
+  const aMatch = Number(game.matchScore?.A ?? 0) || 0;
+  const bMatch = Number(game.matchScore?.B ?? 0) || 0;
   const won = game.challengeWon;
+
+  const lastLabel = (l) => {
+    if (!l) return '—';
+    const t = l.shotType === 'gamechanger' ? 'GC'
+            : l.shotType === 'bonus' ? 'Bonus'
+            : l.shotType === 'mid' ? 'Mid'
+            : l.shotType === 'long' ? 'Long'
+            : l.shotType || 'Shot';
+    const mb = l.moneyball ? '$ ' : '';
+    return `${mb}${t} ${l.made ? '✓' : '✗'}`;
+  };
 
   return (
     <View style={styles.container}>
       <Text style={styles.h1}>Stat Entry</Text>
       <Text style={styles.meta}>
-        Challenge {Number(game.currentChallengeIndex) + 1} • Match {game.matchScore?.A ?? 0} - {game.matchScore?.B ?? 0}
+        Challenge {Number(game.currentChallengeIndex) + 1} • Match {aMatch} - {bMatch}
       </Text>
 
-      {/* Presence / Locks UI */}
-      <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Trackers</Text>
-
-        {/* Main admin panel */}
-        {isMain ? (
-          <>
-            <View style={styles.lockRow}>
-              <Text style={styles.lockLabel}>Team A lock:</Text>
-              <Text style={styles.lockVal}>{lockA ? lockA : '—'}</Text>
-              <TouchableOpacity style={styles.smallBtn} onPress={() => clearTeam('A')}>
-                <Text style={styles.smallBtnTxt}>Clear A</Text>
-              </TouchableOpacity>
-            </View>
-            <View style={styles.lockRow}>
-              <Text style={styles.lockLabel}>Team B lock:</Text>
-              <Text style={styles.lockVal}>{lockB ? lockB : '—'}</Text>
-              <TouchableOpacity style={styles.smallBtn} onPress={() => clearTeam('B')}>
-                <Text style={styles.smallBtnTxt}>Clear B</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={{ marginTop: 6 }}>
-              {trackers
-                .filter(t => t.id !== uid)
-                .map(t => (
-                  <View key={t.id} style={styles.trackerRow}>
-                    <Text style={{ flex: 1 }}>uid: {t.id} • pref: {t.team || '—'}</Text>
-                    {/* Allow assign if slot free or already owned by that uid */}
-                    <TouchableOpacity
-                      style={[styles.smallBtn, (!lockA || lockA === t.id) ? null : styles.disabled]}
-                      disabled={!!lockA && lockA !== t.id}
-                      onPress={() => assignTeam('A', t.id)}
-                    >
-                      <Text style={styles.smallBtnTxt}>Assign A</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[styles.smallBtn, (!lockB || lockB === t.id) ? null : styles.disabled]}
-                      disabled={!!lockB && lockB !== t.id}
-                      onPress={() => assignTeam('B', t.id)}
-                    >
-                      <Text style={styles.smallBtnTxt}>Assign B</Text>
-                    </TouchableOpacity>
-                  </View>
-                ))}
-              {trackers.filter(t => t.id !== uid).length === 0 && (
-                <Text style={{ color: '#666' }}>No other trackers present yet.</Text>
-              )}
-            </View>
-          </>
-        ) : (
-          // Secondary tracker self-join panel
-          <View style={styles.joinRow}>
-            <Text style={{ marginRight: 8 }}>You: {myTrack?.team ? `tracking Team ${myTrack.team}` : 'not assigned'}</Text>
-            <TouchableOpacity
-              style={[styles.smallBtn, canJoinA ? null : styles.disabled]}
-              disabled={!canJoinA}
-              onPress={() => joinTeam('A')}
-            >
-              <Text style={styles.smallBtnTxt}>Join Team A</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.smallBtn, canJoinB ? null : styles.disabled]}
-              disabled={!canJoinB}
-              onPress={() => joinTeam('B')}
-            >
-              <Text style={styles.smallBtnTxt}>Join Team B</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-      </View>
-
-      {/* Top controls row */}
-      <View style={styles.row}>
-        {/* Moneyball toggle hidden during Bonus Round */}
-        {!bonusActive && game.status !== 'ended' && (
+      {/* Top control bar: Bonus + Undo + End Match */}
+      <View style={[styles.row, { marginBottom: 6 }]}>
+        {!bonusActive && (
           <TouchableOpacity
             onPress={() => setMoneyballArmed(v => !v)}
             style={[styles.moneyToggle, moneyballArmed && styles.moneyToggleOn]}
@@ -334,21 +318,24 @@ export default function StatEntryScreen({ route, navigation }) {
 
         <View style={{ flex: 1 }} />
 
-        {/* Bonus Round toggle for main tracker */}
         <View style={styles.bonusToggleWrap}>
-          <Text style={styles.bonusLabel}>
-            {game.status === 'ended' ? 'Game Ended' : (bonusActive ? 'Bonus Round ON' : 'Bonus Round OFF')}
-          </Text>
-          <Switch value={bonusActive} onValueChange={toggleBonus} disabled={!isMain || game.status === 'ended'} />
+          <Text style={styles.bonusLabel}>{bonusActive ? 'Bonus ON' : 'Bonus OFF'}</Text>
+          <Switch value={bonusActive} onValueChange={toggleBonus} disabled={!isMain} />
         </View>
 
-        <TouchableOpacity onPress={undoLast} style={[styles.undo, { marginLeft: 8 }]} disabled={game.status === 'ended'}>
+        <TouchableOpacity onPress={undoLast} style={[styles.undo, { marginLeft: 8 }]}>
           <Text style={{ color: 'white', fontWeight: '700' }}>Undo</Text>
         </TouchableOpacity>
+
+        {isMain && (
+          <TouchableOpacity onPress={endMatchNow} style={[styles.endBtn, { marginLeft: 8 }]}>
+            <Text style={styles.endTxt}>End Match</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       {/* Clock controls */}
-      <View style={[styles.row, { marginBottom: 10 }]}>
+      <View style={[styles.row, { marginBottom: 8 }]}>
         <Text style={{ fontWeight: '700' }}>Clock:</Text>
         <Text style={{ marginLeft: 8 }}>
           {formatClock(computeDisplayedSeconds(game.clockSeconds, game.clockRunning, game.lastStartAt))}
@@ -356,61 +343,163 @@ export default function StatEntryScreen({ route, navigation }) {
         </Text>
       </View>
 
-      <View style={[styles.row, { marginBottom: 12, gap: 8 }]}>
+      <View style={[styles.row, { marginBottom: 12, gap: 8, flexWrap: 'wrap' }]}>
         <TextInput
           placeholder="Set seconds"
           value={newClock}
           onChangeText={setNewClock}
           keyboardType="numeric"
           style={styles.input}
-          editable={game.status !== 'ended'}
         />
-        <TouchableOpacity style={styles.smallBtn} onPress={doSetClock} disabled={game.status === 'ended'}>
-          <Text style={styles.smallBtnTxt}>Set</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.smallBtn} onPress={() => startClock(gameId)} disabled={game.status === 'ended'}>
-          <Text style={styles.smallBtnTxt}>Start</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.smallBtn} onPress={() => stopClock(gameId)} disabled={game.status === 'ended'}>
-          <Text style={styles.smallBtnTxt}>Stop</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.smallBtn}
-          onPress={() => resetClockSeconds(gameId, Number(newClock) || game.clockSeconds)}
-          disabled={game.status === 'ended'}
-        >
-          <Text style={styles.smallBtnTxt}>Reset</Text>
-        </TouchableOpacity>
+        <TouchableOpacity style={styles.smallBtn} onPress={doSetClock}><Text style={styles.smallBtnTxt}>Set</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.smallBtn} onPress={() => startClock(gameId)}><Text style={styles.smallBtnTxt}>Start</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.smallBtn} onPress={() => stopClock(gameId)}><Text style={styles.smallBtnTxt}>Stop</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.smallBtn} onPress={() => resetClockSeconds(gameId, Number(newClock) || game.clockSeconds)}><Text style={styles.smallBtnTxt}>Reset</Text></TouchableOpacity>
       </View>
 
-      {/* Scores for current challenge with win highlight */}
-      <View style={styles.scoreRow}>
-        <Text style={[styles.sideScore, won?.team === 'A' ? styles.winScore : null]}>{aCh}</Text>
-        <View style={styles.centerBlock}>
-          <Text style={styles.centerTitle}>Current Challenge</Text>
-          <Text style={styles.centerBig}>{aCh} : {bCh}</Text>
-          {won && (
-            <Text style={styles.winBanner}>
-              Team {won.team} won +{won.pointsForWin} — tap Next Challenge when ready
-            </Text>
-          )}
-        </View>
-        <Text style={[styles.sideScore, won?.team === 'B' ? styles.winScore : null]}>{bCh}</Text>
+      {/* Presence / Locks (collapsible) */}
+      <View style={styles.panel}>
+        <TouchableOpacity onPress={() => setAssignOpen(v => !v)} style={styles.panelHeader}>
+          <Text style={styles.panelTitle}>Trackers & Team Assign</Text>
+          <Text style={styles.caret}>{assignOpen ? '▲' : '▼'}</Text>
+        </TouchableOpacity>
+
+        {assignOpen && (
+          <>
+            {isMain ? (
+              <>
+                <View style={styles.lockRow}>
+                  <Text style={styles.lockLabel}>Team A lock:</Text>
+                  <Text style={styles.lockVal}>{lockA ? lockA : '—'}</Text>
+                  <TouchableOpacity style={styles.smallBtn} onPress={() => clearTeam('A')}>
+                    <Text style={styles.smallBtnTxt}>Clear A</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.lockRow}>
+                  <Text style={styles.lockLabel}>Team B lock:</Text>
+                  <Text style={styles.lockVal}>{lockB ? lockB : '—'}</Text>
+                  <TouchableOpacity style={styles.smallBtn} onPress={() => clearTeam('B')}>
+                    <Text style={styles.smallBtnTxt}>Clear B</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={{ marginTop: 6 }}>
+                  {trackers
+                    .filter(t => t.id !== uid)
+                    .map(t => (
+                      <View key={t.id} style={styles.trackerRow}>
+                        <Text style={{ flex: 1 }}>uid: {t.id} • pref: {t.team || '—'}</Text>
+                        <TouchableOpacity
+                          style={[styles.smallBtn, (!lockA || lockA === t.id) ? null : styles.disabled]}
+                          disabled={!!lockA && lockA !== t.id}
+                          onPress={() => assignTeam('A', t.id)}
+                        >
+                          <Text style={styles.smallBtnTxt}>Assign A</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[styles.smallBtn, (!lockB || lockB === t.id) ? null : styles.disabled]}
+                          disabled={!!lockB && lockB !== t.id}
+                          onPress={() => assignTeam('B', t.id)}
+                        >
+                          <Text style={styles.smallBtnTxt}>Assign B</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  {trackers.filter(t => t.id !== uid).length === 0 && (
+                    <Text style={{ color: '#666' }}>No other trackers present yet.</Text>
+                  )}
+                </View>
+              </>
+            ) : (
+              <View style={styles.joinRow}>
+                <Text style={{ marginRight: 8 }}>You: {myTrack?.team ? `tracking Team ${myTrack.team}` : 'not assigned'}</Text>
+                <TouchableOpacity
+                  style={[styles.smallBtn, canJoinA ? null : styles.disabled]}
+                  disabled={!canJoinA}
+                  onPress={() => joinTeam('A')}
+                >
+                  <Text style={styles.smallBtnTxt}>Join Team A</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.smallBtn, canJoinB ? null : styles.disabled]}
+                  disabled={!canJoinB}
+                  onPress={() => joinTeam('B')}
+                >
+                  <Text style={styles.smallBtnTxt}>Join Team B</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </>
+        )}
       </View>
+
+      {/* Freestyle controls (robust detection) */}
+      {isFreestyle && (
+        <View style={[styles.panel, { marginTop: 0 }]}>
+          <Text style={styles.panelTitle}>Freestyle — Set Challenge Rules</Text>
+          <View style={[styles.row, { gap: 8, flexWrap: 'wrap' }]}>
+            <TextInput
+              placeholder="Target Score (e.g., 5)"
+              value={fsTarget}
+              onChangeText={setFsTarget}
+              keyboardType="numeric"
+              style={[styles.input, { minWidth: 150 }]}
+            />
+            <TextInput
+              placeholder="Points for Win (e.g., 1)"
+              value={fsWorth}
+              onChangeText={setFsWorth}
+              keyboardType="numeric"
+              style={[styles.input, { minWidth: 170 }]}
+            />
+            <TouchableOpacity style={styles.smallBtn} onPress={applyFreestyle}>
+              <Text style={styles.smallBtnTxt}>Apply</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={{ color: '#666', marginTop: 6 }}>
+            Current: to {Number(game.freestyleTarget ?? 0)} • worth {Number(game.freestyleWorth ?? 0)}
+          </Text>
+        </View>
+      )}
+
+      {/* Scores (show Match when Bonus) */}
+      {!bonusActive ? (
+        <View style={styles.scoreRow}>
+          <Text style={[styles.sideScore, game.challengeWon?.team === 'A' ? styles.winScore : null]}>{aCh}</Text>
+          <View style={styles.centerBlock}>
+            <Text style={styles.centerTitle}>Current Challenge</Text>
+            <Text style={styles.centerBig}>{aCh} : {bCh}</Text>
+          </View>
+          <Text style={[styles.sideScore, game.challengeWon?.team === 'B' ? styles.winScore : null]}>{bCh}</Text>
+        </View>
+      ) : (
+        <View style={[styles.scoreRow, { marginTop: 2 }]}>
+          <Text style={[styles.sideScore, styles.matchSide]}>{aMatch}</Text>
+          <View style={styles.centerBlock}>
+            <Text style={styles.centerTitle}>Match (Bonus Round)</Text>
+            <Text style={[styles.centerBig, { fontSize: 40 }]}>{aMatch} : {bMatch}</Text>
+          </View>
+          <Text style={[styles.sideScore, styles.matchSide]}>{bMatch}</Text>
+        </View>
+      )}
 
       {/* Players & shot buttons */}
       <FlatList
         data={players}
         keyExtractor={(p) => p.id}
         renderItem={({ item }) => {
-          const disabled = !canTap(item.id) || !!won || game.status === 'ended';
+          const disabled = !canTap(item.id) || !!won;
+          const last = lastByPlayer[item.id];
           return (
             <View style={[styles.card, item.team === 'A' ? styles.cardA : styles.cardB, disabled && styles.cardDisabled]}>
-              <Text style={styles.playerName}>{item.id}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <Text style={styles.playerName}>{item.id}</Text>
+                <Text style={styles.lastShotTag}>Last: {last ? lastLabel(last) : '—'}</Text>
+              </View>
+
               <View style={styles.btnRow}>
                 {!bonusActive ? (
                   <>
-                    {/* MID */}
                     <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'mid', true)}>
                       <Text style={styles.btnTxt}>Mid ✓</Text>
                     </TouchableOpacity>
@@ -418,7 +507,6 @@ export default function StatEntryScreen({ route, navigation }) {
                       <Text style={styles.btnAltTxt}>Mid ✗</Text>
                     </TouchableOpacity>
 
-                    {/* LONG */}
                     <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'long', true)}>
                       <Text style={styles.btnTxt}>Long ✓</Text>
                     </TouchableOpacity>
@@ -426,7 +514,6 @@ export default function StatEntryScreen({ route, navigation }) {
                       <Text style={styles.btnAltTxt}>Long ✗</Text>
                     </TouchableOpacity>
 
-                    {/* GAMECHANGER */}
                     <TouchableOpacity style={[styles.btnGC, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'gamechanger', true)}>
                       <Text style={styles.btnTxt}>GC ✓</Text>
                     </TouchableOpacity>
@@ -436,7 +523,6 @@ export default function StatEntryScreen({ route, navigation }) {
                   </>
                 ) : (
                   <>
-                    {/* BONUS (Bonus Round only) */}
                     <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus', true)}>
                       <Text style={styles.btnTxt}>Bonus ✓</Text>
                     </TouchableOpacity>
@@ -444,7 +530,6 @@ export default function StatEntryScreen({ route, navigation }) {
                       <Text style={styles.btnAltTxt}>Bonus ✗</Text>
                     </TouchableOpacity>
 
-                    {/* GAMECHANGER (still available in Bonus) */}
                     <TouchableOpacity style={[styles.btnGC, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'gamechanger', true)}>
                       <Text style={styles.btnTxt}>GC ✓</Text>
                     </TouchableOpacity>
@@ -460,41 +545,22 @@ export default function StatEntryScreen({ route, navigation }) {
         ListEmptyComponent={<Text>No players on this game.</Text>}
       />
 
-      {/* Next challenge button only when we have a winner */}
-      {won && game.status !== 'ended' && (
-        <TouchableOpacity style={styles.nextBtn} onPress={doAdvance}>
-          <Text style={styles.nextTxt}>Next Challenge</Text>
-        </TouchableOpacity>
-      )}
-
-      {/* END GAME (main tracker only) */}
-      {isMain && (
-        <TouchableOpacity
-          style={[styles.nextBtn, { backgroundColor: '#b00020', marginTop: 10 }]}
-          onPress={onEndGame}
-        >
-          <Text style={styles.nextTxt}>{game.status === 'ended' ? 'View Box Score' : 'End Game'}</Text>
-        </TouchableOpacity>
-      )}
+      {/* Bottom actions */}
+      <View style={{ flexDirection: 'row', gap: 10 }}>
+        {won && (
+          <TouchableOpacity style={[styles.nextBtn, { flex: 1 }]} onPress={doAdvance}>
+            <Text style={styles.nextTxt}>Next Challenge</Text>
+          </TouchableOpacity>
+        )}
+        {isMain && (
+          <TouchableOpacity style={[styles.endBtn, { flex: 1 }]} onPress={endMatchNow}>
+            <Text style={styles.endTxt}>End Match</Text>
+          </TouchableOpacity>
+        )}
+      </View>
     </View>
   );
 }
-
-/* -------- clock helpers -------- */
-const computeDisplayedSeconds = (clockSeconds, running, lastStartAt) => {
-  const base = Number(clockSeconds || 0);
-  if (!running || !lastStartAt) return base;
-  const lastMs = lastStartAt.toMillis ? lastStartAt.toMillis() : Date.parse(lastStartAt);
-  const elapsed = Math.max(0, Math.floor((Date.now() - lastMs) / 1000));
-  return Math.max(0, base - elapsed);
-};
-
-const formatClock = (sec) => {
-  if (!Number.isFinite(sec)) return '--:--';
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-};
 
 /* -------- styles -------- */
 const styles = StyleSheet.create({
@@ -503,16 +569,18 @@ const styles = StyleSheet.create({
   h1: { fontSize: 20, fontWeight: '800' },
   meta: { color: '#666', marginBottom: 6 },
 
-  panel: { borderWidth: 1, borderColor: '#eee', borderRadius: 10, padding: 10, marginBottom: 10 },
-  panelTitle: { fontWeight: '800', marginBottom: 6 },
-  lockRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 6 },
+  panel: { borderWidth: 1, borderColor: '#eee', borderRadius: 10, padding: 10, marginBottom: 10, backgroundColor: '#fafafa' },
+  panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  panelTitle: { fontWeight: '800' },
+  caret: { fontWeight: '900', fontSize: 16 },
+  lockRow: { flexDirection: 'row', alignItems: 'center', marginTop: 8 },
   lockLabel: { width: 100, color: '#333' },
   lockVal: { flex: 1, color: '#555' },
-  trackerRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 6, gap: 8 },
-  joinRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  trackerRow: { flexDirection: 'row', alignItems: 'center', marginTop: 6, gap: 8 },
+  joinRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 },
 
   row: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  input: { borderWidth: 1, borderColor: '#ddd', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, minWidth: 110 },
+  input: { borderWidth: 1, borderColor: '#ddd', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, minWidth: 110, backgroundColor: 'white' },
 
   undo: { backgroundColor: '#111', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8 },
   moneyToggle: { backgroundColor: '#eee', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, marginRight: 10 },
@@ -524,19 +592,20 @@ const styles = StyleSheet.create({
 
   scoreRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginVertical: 6 },
   sideScore: { fontSize: 28, fontWeight: '800', width: 64, textAlign: 'center' },
+  matchSide: { color: '#111' },
   winScore: { color: '#0a0' },
   centerBlock: { alignItems: 'center', justifyContent: 'center', flex: 1 },
   centerTitle: { color: '#666', fontSize: 12 },
   centerBig: { fontSize: 32, fontWeight: '800' },
-  winBanner: { marginTop: 6, color: '#0a0', fontWeight: '700' },
 
-  card: { borderWidth: 1, borderColor: '#eee', borderRadius: 12, padding: 12, marginBottom: 12 },
+  card: { borderWidth: 1, borderColor: '#eee', borderRadius: 12, padding: 12, marginBottom: 12, backgroundColor: 'white' },
   cardA: { backgroundColor: 'rgba(80, 140, 255, 0.05)' },
   cardB: { backgroundColor: 'rgba(255, 140, 80, 0.05)' },
   cardDisabled: { opacity: 0.45 },
-  playerName: { fontWeight: '700', marginBottom: 8 },
+  playerName: { fontWeight: '700' },
+  lastShotTag: { fontSize: 12, color: '#444' },
 
-  btnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  btnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8 },
   btn: { backgroundColor: '#0a0', paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, marginRight: 8, marginBottom: 8 },
   btnGC: { backgroundColor: '#a50', paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, marginRight: 8, marginBottom: 8 },
   btnAlt: { backgroundColor: '#eee', paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, marginRight: 8, marginBottom: 8 },
@@ -548,5 +617,8 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.4 },
 
   nextBtn: { marginTop: 8, backgroundColor: '#111', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
-  nextTxt: { color: 'white', fontWeight: '800' }
+  nextTxt: { color: 'white', fontWeight: '800' },
+
+  endBtn: { backgroundColor: '#b00', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, alignItems: 'center' },
+  endTxt: { color: 'white', fontWeight: '800' },
 });
