@@ -2,7 +2,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, Alert, TextInput, Switch } from 'react-native';
 import { db, auth } from '../services/firebase';
-import { doc, onSnapshot, collection, query, orderBy, onSnapshot as onSnapCol, updateDoc } from 'firebase/firestore';
+import { doc, onSnapshot, collection, query, orderBy, onSnapshot as onSnapCol, updateDoc, where } from 'firebase/firestore';
+import { setPaused, toggleFlipSides } from '../services/gameService';
+import CameraStatusBar from '../components/CameraStatusBar';
+import { startAutoCoordinator, setAutoMode } from '../services/autoTrackingService';
 
 import {
   logShot,
@@ -69,6 +72,12 @@ export default function StatEntryScreen({ route, navigation }) {
   const [fsTarget, setFsTarget] = useState('');
   const [fsWorth, setFsWorth] = useState('');
 
+  // challenge menu UI
+  const [challengeMenuOpen, setChallengeMenuOpen] = useState(false);
+
+  // proposals badge
+  const [pendingCount, setPendingCount] = useState(0);
+
   // subscribe to game + logs
   useEffect(() => {
     if (!gameId) return;
@@ -92,7 +101,11 @@ export default function StatEntryScreen({ route, navigation }) {
     const q = query(collection(db, 'games', gameId, 'logs'), orderBy('ts', 'desc'));
     const unsubLogs = onSnapCol(q, s => setLogs(s.docs.map(d => ({ id: d.id, ...d.data() }))));
 
-    return () => { unsubGame && unsubGame(); unsubLogs && unsubLogs(); };
+    // listen pending proposals for badge
+    const pq = query(collection(db, 'games', gameId, 'proposals'), where('status', '==', 'pending'));
+    const unsubProps = onSnapCol(pq, (s) => setPendingCount(s.size));
+
+    return () => { unsubGame && unsubGame(); unsubLogs && unsubLogs(); unsubProps && unsubProps(); };
   }, [gameId, fsTarget, fsWorth]);
 
   // subscribe to presence
@@ -110,6 +123,13 @@ export default function StatEntryScreen({ route, navigation }) {
     const id = setInterval(() => setTick(t => (t + 1) % 60), 1000);
     return () => clearInterval(id);
   }, [game?.clockRunning, game?.lastStartAt]);
+
+  // start auto coordinator
+  useEffect(() => {
+    if (!gameId) return;
+    const stop = startAutoCoordinator(gameId);
+    return () => stop && stop();
+  }, [gameId]);
 
   const isMain = !!uid && uid === game?.roles?.main;
   const lockA = game?.trackerLocks?.A?.uid || null;
@@ -182,6 +202,7 @@ export default function StatEntryScreen({ route, navigation }) {
   const doAdvance = async () => {
     try {
       await advanceToNextChallenge(gameId);
+      setChallengeMenuOpen(false);
     } catch (e) {
       Alert.alert('Advance failed', e.message);
     }
@@ -272,7 +293,7 @@ export default function StatEntryScreen({ route, navigation }) {
     }
   };
 
-  // ----- after hooks -----
+  // ----- derived -----
   if (!game) {
     return (
       <View style={styles.center}>
@@ -289,24 +310,48 @@ export default function StatEntryScreen({ route, navigation }) {
 
   const lastLabel = (l) => {
     if (!l) return '—';
-    const t = l.shotType === 'gamechanger' ? 'GC'
-            : l.shotType === 'bonus' ? 'Bonus'
-            : l.shotType === 'mid' ? 'Mid'
-            : l.shotType === 'long' ? 'Long'
-            : l.shotType || 'Shot';
+    const t =
+      l.shotType === 'gamechanger' ? 'GC'
+      : l.shotType === 'bonus' ? 'Bonus' // legacy
+      : l.shotType === 'bonus_mid' ? 'B-MR'
+      : l.shotType === 'bonus_long' ? 'B-LR'
+      : l.shotType === 'bonus_gc' ? 'B-GC'
+      : l.shotType === 'mid' ? 'Mid'
+      : l.shotType === 'long' ? 'Long'
+      : l.shotType || 'Shot';
     const mb = l.moneyball ? '$ ' : '';
     return `${mb}${t} ${l.made ? '✓' : '✗'}`;
   };
 
+  // challenge indices for menu
+  const totalChallenges = Array.isArray(game.sequenceChallengeIds) ? game.sequenceChallengeIds.length : 0;
+  const currIdx = Number(game.currentChallengeIndex ?? 0);
+  const nextIdx = currIdx + 1 < totalChallenges ? currIdx + 1 : null;
+
   return (
     <View style={styles.container}>
       <Text style={styles.h1}>Stat Entry</Text>
+
+      {/* Top meta line */}
       <Text style={styles.meta}>
-        Challenge {Number(game.currentChallengeIndex) + 1} • Match {aMatch} - {bMatch}
+        Challenge {Number(game.currentChallengeIndex) + 1} • Match {aMatch} - {bMatch} {game.paused ? '• PAUSED' : ''}
       </Text>
 
-      {/* Top control bar: Bonus + Undo + End Match */}
-      <View style={[styles.row, { marginBottom: 6 }]}>
+      {/* Camera readiness & Auto-mode config */}
+      <CameraStatusBar
+        gameId={gameId}
+        onAddCamera={() => navigation.navigate('CameraRegistration', { gameId })}
+      />
+      <AutoModePanel game={game} gameId={gameId} navigation={navigation} />
+
+      {game.paused && (
+        <View style={styles.pausedBanner}>
+          <Text style={styles.pausedTxt}>PAUSED — Dispute Mode (auto ingest disabled)</Text>
+        </View>
+      )}
+
+      {/* Top control bar: Moneyball + Flip + Bonus + Undo + Review Queue + Pause/Dispute + End Match */}
+      <View style={[styles.row, { marginBottom: 6, flexWrap: 'wrap', gap: 8 }]}>
         {!bonusActive && (
           <TouchableOpacity
             onPress={() => setMoneyballArmed(v => !v)}
@@ -318,17 +363,49 @@ export default function StatEntryScreen({ route, navigation }) {
 
         <View style={{ flex: 1 }} />
 
+        {/* Global Flip Sides (affects CastingDisplay) */}
+        <TouchableOpacity
+          onPress={() => toggleFlipSides(gameId).catch(e => Alert.alert('Flip failed', e.message))}
+          style={styles.smallBtn}
+        >
+          <Text style={styles.smallBtnTxt}>Flip Sides</Text>
+        </TouchableOpacity>
+
         <View style={styles.bonusToggleWrap}>
           <Text style={styles.bonusLabel}>{bonusActive ? 'Bonus ON' : 'Bonus OFF'}</Text>
           <Switch value={bonusActive} onValueChange={toggleBonus} disabled={!isMain} />
         </View>
 
-        <TouchableOpacity onPress={undoLast} style={[styles.undo, { marginLeft: 8 }]}>
+        <TouchableOpacity onPress={undoLast} style={[styles.undo]}>
           <Text style={{ color: 'white', fontWeight: '700' }}>Undo</Text>
         </TouchableOpacity>
 
+        {/* Review Queue with pending badge */}
+        <TouchableOpacity
+          onPress={() => navigation.navigate('ReviewQueueScreen', { gameId })}
+          style={[styles.smallBtn, { position: 'relative' }]}
+        >
+          <Text style={styles.smallBtnTxt}>Review Queue</Text>
+          {!!pendingCount && (
+            <View style={styles.badge}>
+              <Text style={styles.badgeTxt}>{pendingCount}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+
+        {/* Pause / Dispute toggle */}
+        <TouchableOpacity
+          onPress={() => setPaused(gameId, !game?.paused).catch(e => Alert.alert('Pause failed', e.message))}
+          style={[
+            styles.smallBtn,
+            { backgroundColor: game?.paused ? '#0a0' : '#b80' }
+          ]}
+        >
+          <Text style={styles.smallBtnTxt}>{game?.paused ? 'Resume' : 'Pause / Dispute'}</Text>
+        </TouchableOpacity>
+
         {isMain && (
-          <TouchableOpacity onPress={endMatchNow} style={[styles.endBtn, { marginLeft: 8 }]}>
+          <TouchableOpacity onPress={endMatchNow} style={[styles.endBtn]}>
             <Text style={styles.endTxt}>End Match</Text>
           </TouchableOpacity>
         )}
@@ -352,10 +429,51 @@ export default function StatEntryScreen({ route, navigation }) {
           style={styles.input}
         />
         <TouchableOpacity style={styles.smallBtn} onPress={doSetClock}><Text style={styles.smallBtnTxt}>Set</Text></TouchableOpacity>
-        <TouchableOpacity style={styles.smallBtn} onPress={() => startClock(gameId)}><Text style={styles.smallBtnTxt}>Start</Text></TouchableOpacity>
+        <TouchableOpacity style={styles.smallBtn} onPress={() => startClock(gameId)} disabled={game?.paused}><Text style={styles.smallBtnTxt}>Start</Text></TouchableOpacity>
         <TouchableOpacity style={styles.smallBtn} onPress={() => stopClock(gameId)}><Text style={styles.smallBtnTxt}>Stop</Text></TouchableOpacity>
         <TouchableOpacity style={styles.smallBtn} onPress={() => resetClockSeconds(gameId, Number(newClock) || game.clockSeconds)}><Text style={styles.smallBtnTxt}>Reset</Text></TouchableOpacity>
+
+        {/* Challenge Menu */}
+        <TouchableOpacity
+          style={[styles.smallBtn, { marginLeft: 6 }]}
+          onPress={() => setChallengeMenuOpen(v => !v)}
+        >
+          <Text style={styles.smallBtnTxt}>Challenge ▾</Text>
+        </TouchableOpacity>
       </View>
+
+      {/* Auto Mode toggle summary (main only) */}
+      {isMain && (
+        <View style={[styles.row, { marginBottom: 10, alignItems: 'center' }]}>
+          <Text style={{ fontWeight: '700', marginRight: 8 }}>Auto Mode:</Text>
+          <Switch
+            value={!!game?.autoMode?.enabled}
+            onValueChange={(v)=>setAutoMode(gameId, {
+              enabled: v,
+              ingestThreshold: game?.autoMode?.ingestThreshold ?? 0.85,
+              reviewThreshold: game?.autoMode?.reviewThreshold ?? 0.65
+            })}
+          />
+          <Text style={{ marginLeft: 10, color: '#666' }}>
+            ingest≥{Math.round((game?.autoMode?.ingestThreshold ?? 0.85)*100)}% • review≥{Math.round((game?.autoMode?.reviewThreshold ?? 0.65)*100)}%
+          </Text>
+        </View>
+      )}
+
+      {/* Challenge Menu (Current / Next / Skip) */}
+      {challengeMenuOpen && (
+        <View style={styles.menuCard}>
+          <Text style={styles.menuTitle}>
+            Current: {totalChallenges ? `Challenge ${currIdx + 1} of ${totalChallenges}` : (isFreestyle ? 'Freestyle' : '—')}
+          </Text>
+          <Text style={styles.menuText}>
+            Next: {nextIdx !== null ? `Challenge ${nextIdx + 1} of ${totalChallenges}` : (isFreestyle ? 'Freestyle (N/A)' : '—')}
+          </Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={doAdvance}>
+            <Text style={styles.primaryBtnTxt}>Skip to Next</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {/* Presence / Locks (collapsible) */}
       <View style={styles.panel}>
@@ -523,18 +641,26 @@ export default function StatEntryScreen({ route, navigation }) {
                   </>
                 ) : (
                   <>
-                    <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus', true)}>
-                      <Text style={styles.btnTxt}>Bonus ✓</Text>
+                    {/* Bonus round specific buttons */}
+                    <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_mid', true)}>
+                      <Text style={styles.btnTxt}>B-MR ✓</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={[styles.btnAlt, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus', false)}>
-                      <Text style={styles.btnAltTxt}>Bonus ✗</Text>
+                    <TouchableOpacity style={[styles.btnAlt, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_mid', false)}>
+                      <Text style={styles.btnAltTxt}>B-MR ✗</Text>
                     </TouchableOpacity>
 
-                    <TouchableOpacity style={[styles.btnGC, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'gamechanger', true)}>
-                      <Text style={styles.btnTxt}>GC ✓</Text>
+                    <TouchableOpacity style={[styles.btn, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_long', true)}>
+                      <Text style={styles.btnTxt}>B-LR ✓</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={[styles.btnAlt, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'gamechanger', false)}>
-                      <Text style={styles.btnAltTxt}>GC ✗</Text>
+                    <TouchableOpacity style={[styles.btnAlt, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_long', false)}>
+                      <Text style={styles.btnAltTxt}>B-LR ✗</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity style={[styles.btnGC, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_gc', true)}>
+                      <Text style={styles.btnTxt}>B-GC ✓</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.btnAlt, disabled && styles.disabled]} disabled={disabled} onPress={() => record(item.id, 'bonus_gc', false)}>
+                      <Text style={styles.btnAltTxt}>B-GC ✗</Text>
                     </TouchableOpacity>
                   </>
                 )}
@@ -562,12 +688,87 @@ export default function StatEntryScreen({ route, navigation }) {
   );
 }
 
+function AutoModePanel({ game, gameId, navigation }) {
+  const [enabled, setEnabled] = useState(!!game?.autoMode?.enabled);
+  const [ingest, setIngest] = useState(String(game?.autoMode?.ingestThreshold ?? 0.85));
+  const [review, setReview] = useState(String(game?.autoMode?.reviewThreshold ?? 0.65));
+  useEffect(() => {
+    setEnabled(!!game?.autoMode?.enabled);
+    setIngest(String(game?.autoMode?.ingestThreshold ?? 0.85));
+    setReview(String(game?.autoMode?.reviewThreshold ?? 0.65));
+  }, [game?.autoMode]);
+
+  const save = async () => {
+    const i = Math.max(0, Math.min(1, Number(ingest) || 0.85));
+    const r = Math.max(0, Math.min(1, Number(review) || 0.65));
+    if (r > i) {
+      Alert.alert('Invalid thresholds', 'Review threshold must be ≤ ingest threshold.');
+      return;
+    }
+    try {
+      await setAutoMode(gameId, { enabled, ingestThreshold: i, reviewThreshold: r, gateByClock: true });
+      Alert.alert('Saved', 'Auto-Mode settings updated.');
+    } catch (e) {
+      Alert.alert('Error', e.message);
+    }
+  };
+
+  return (
+    <View style={{ borderWidth:1, borderColor:'#eee', borderRadius:10, padding:10, backgroundColor:'#fafafa', marginBottom:10 }}>
+      <Text style={{ fontWeight:'800', marginBottom:8 }}>Auto-Mode</Text>
+      <View style={{ flexDirection:'row', alignItems:'center', gap:8, marginBottom:8 }}>
+        <Text style={{ fontWeight:'700' }}>Enabled</Text>
+        <Switch value={enabled} onValueChange={setEnabled} />
+        <View style={{ flex:1 }} />
+        <TouchableOpacity
+          style={{ backgroundColor:'#111', paddingVertical:6, paddingHorizontal:10, borderRadius:8 }}
+          onPress={() => navigation.navigate('ReviewQueueScreen', { gameId })}
+        >
+          <Text style={{ color:'#fff', fontWeight:'700' }}>Open Review Queue</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={{ flexDirection:'row', gap:8 }}>
+        <View style={{ flex:1 }}>
+          <Text style={{ fontWeight:'700', marginBottom:4 }}>Ingest ≥</Text>
+          <TextInput style={{ borderWidth:1, borderColor:'#ddd', borderRadius:8, paddingHorizontal:10, paddingVertical:6 }}
+            value={ingest} onChangeText={setIngest} placeholder="0.85" keyboardType="decimal-pad" />
+        </View>
+        <View style={{ flex:1 }}>
+          <Text style={{ fontWeight:'700', marginBottom:4 }}>Review ≥</Text>
+          <TextInput style={{ borderWidth:1, borderColor:'#ddd', borderRadius:8, paddingHorizontal:10, paddingVertical:6 }}
+            value={review} onChangeText={setReview} placeholder="0.65" keyboardType="decimal-pad" />
+        </View>
+        <View style={{ alignItems:'center', justifyContent:'flex-end' }}>
+          <TouchableOpacity onPress={save} style={{ backgroundColor:'#111', paddingVertical:10, paddingHorizontal:14, borderRadius:10 }}>
+            <Text style={{ color:'#fff', fontWeight:'900' }}>Save</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      <Text style={{ color:'#666', marginTop:6, fontSize:12 }}>
+        Clock gating is always ON: auto events are ignored unless the clock is running and game status is “live”.
+      </Text>
+    </View>
+  );
+}
+
 /* -------- styles -------- */
 const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   container: { flex: 1, padding: 12, backgroundColor: 'white' },
   h1: { fontSize: 20, fontWeight: '800' },
   meta: { color: '#666', marginBottom: 6 },
+
+  pausedBanner: { backgroundColor: '#fde68a', borderColor: '#f59e0b', borderWidth: 1, padding: 8, borderRadius: 8, marginBottom: 8 },
+  pausedTxt: { color: '#7c2d12', fontWeight: '800', textAlign: 'center' },
+
+  badge: { position: 'absolute', top: -6, right: -6, backgroundColor: '#ef4444', borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2, minWidth: 20, alignItems: 'center' },
+  badgeTxt: { color: '#fff', fontWeight: '800', fontSize: 12 },
+
+  menuCard: { backgroundColor: '#fff', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#e5e5e5', marginBottom: 10 },
+  menuTitle: { fontWeight: '800', marginBottom: 6, fontSize: 16 },
+  menuText: { marginBottom: 12 },
+  primaryBtn: { backgroundColor: '#111', paddingVertical: 12, paddingHorizontal: 16, borderRadius: 10 },
+  primaryBtnTxt: { color: '#fff', fontWeight: '900' },
 
   panel: { borderWidth: 1, borderColor: '#eee', borderRadius: 10, padding: 10, marginBottom: 10, backgroundColor: '#fafafa' },
   panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },

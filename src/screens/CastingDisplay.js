@@ -41,10 +41,24 @@ const adjust = (hex, amt) => {
     let r = Math.max(0, Math.min(255, parseInt(h.substring(0,2),16) + amt));
     let g = Math.max(0, Math.min(255, parseInt(h.substring(2,4),16) + amt));
     let b = Math.max(0, Math.min(255, parseInt(h.substring(4,6),16) + amt));
-    const to2 = (n) => n.toString(16).padStart(2,'0');
+    const to2 = (n) => n.toString(16).toUpperCase().padStart(2,'0');
     return `#${to2(r)}${to2(g)}${to2(b)}`;
   } catch { return hex; }
 };
+
+function ensureRow(row, team) {
+  if (row) return row;
+  return {
+    team,
+    total:{m:0,a:0},
+    mid:{m:0,a:0},
+    long:{m:0,a:0},
+    money:{m:0,a:0},
+    gamechanger:{m:0,a:0},
+    bonus:{m:0,a:0},           // NEW: track bonus attempts/makes
+    winners:0
+  };
+}
 
 const buildStats = (logs) => {
   const perPlayer = {};
@@ -61,18 +75,36 @@ const buildStats = (logs) => {
           long: { m: 0, a: 0 },
           money: { m: 0, a: 0 },
           gamechanger: { m: 0, a: 0 },
+          bonus: { m: 0, a: 0 },    // NEW
           winners: 0,
         };
       }
       const row = perPlayer[l.playerId];
+
+      // Total (kept consistent with your prior behavior: ALL attempts)
       row.total.a += 1; if (l.made) row.total.m += 1;
-      if (l.shotType === 'mid') { row.mid.a++; if (l.made) row.mid.m++; }
-      if (l.shotType === 'long') { row.long.a++; if (l.made) row.long.m++; }
-      if (l.shotType === 'gamechanger') { row.gamechanger.a++; if (l.made) row.gamechanger.m++; }
+
+      if (l.shotType === 'mid') {
+        row.mid.a++; if (l.made) row.mid.m++;
+      }
+      if (l.shotType === 'long') {
+        row.long.a++; if (l.made) row.long.m++;
+      }
+      if (l.shotType === 'gamechanger') {
+        row.gamechanger.a++; if (l.made) row.gamechanger.m++;
+      }
+
+      // NEW: bonus bucket (bonus_mid / bonus_long / bonus_gc / legacy 'bonus')
+      if (typeof l.shotType === 'string' && (l.shotType === 'bonus' || l.shotType.startsWith('bonus_'))) {
+        row.bonus.a++; if (l.made) row.bonus.m++;
+      }
+
       if (l.moneyball) { row.money.a++; if (l.made) { row.money.m++; teamMoneyMakes[l.team]++; } }
     }
+
     if (l.type === 'challenge_win' && (l.team === 'A' || l.team === 'B')) {
-      teamWinners[l.team]++; if (l.byPlayerId && perPlayer[l.byPlayerId]) perPlayer[l.byPlayerId].winners++;
+      teamWinners[l.team]++;
+      if (l.byPlayerId && perPlayer[l.byPlayerId]) perPlayer[l.byPlayerId].winners++;
     }
   }
   return { perPlayer, teamMoneyMakes, teamWinners };
@@ -159,8 +191,11 @@ export default function CastingDisplay({ route }) {
   const tA = totals(aList);
   const tB = totals(bList);
 
-  const leftKey  = flipped ? 'B' : 'A';
-  const rightKey = flipped ? 'A' : 'B';
+  // Respect global uiFlipSides if present (so tracker "Flip Sides" also flips casting).
+  // Fallback to local toggle if uiFlipSides is undefined.
+  const flipActive = (typeof game?.uiFlipSides === 'boolean') ? !!game.uiFlipSides : !!flipped;
+  const leftKey  = flipActive ? 'B' : 'A';
+  const rightKey = flipActive ? 'A' : 'B';
 
   const chalA = Number(game?.challengeScore?.A ?? 0) || 0;
   const chalB = Number(game?.challengeScore?.B ?? 0) || 0;
@@ -197,6 +232,7 @@ export default function CastingDisplay({ route }) {
   const blinkOn = !!won && (tick % 2 === 0); // blink every 500ms
   const leftIsWinner  = !!won && ((won.team === leftKey));
   const rightIsWinner = !!won && ((won.team === rightKey));
+  const shutoutActive = !!won?.shutout; // NEW: shutout flag from game.challengeWon
 
   // BONUS — winner highlight (as soon as clock hits 0)
   const bonusTimeUp = bonusActive && computeDisplayedSeconds(game?.clockSeconds, game?.clockRunning, game?.lastStartAt) <= 0;
@@ -283,8 +319,8 @@ export default function CastingDisplay({ route }) {
           leftKey={leftKey}
           rightKey={rightKey}
           theme={theme}
-          colorA={teamColors.A}
-          colorB={teamColors.B}
+          colorA={colorA}
+          colorB={colorB}
           chalLeft={chalLeft}
           chalRight={chalRight}
           matchLeft={matchLeft}
@@ -294,12 +330,13 @@ export default function CastingDisplay({ route }) {
           blinkOn={blinkOn}
           teamAName={game.teamAName || 'Team A'}
           teamBName={game.teamBName || 'Team B'}
+          shutoutActive={shutoutActive}          // NEW: show "SHUTOUT ×2"
         />
       ) : (
         <ScoreRowBonus
           theme={theme}
-          colorLeft={leftKey === 'A' ? teamColors.A : teamColors.B}
-          colorRight={rightKey === 'A' ? teamColors.A : teamColors.B}
+          colorLeft={leftKey === 'A' ? colorA : colorB}
+          colorRight={rightKey === 'A' ? colorA : colorB}
           teamLeft={leftKey === 'A' ? (game.teamAName || 'Team A') : (game.teamBName || 'Team B')}
           teamRight={rightKey === 'A' ? (game.teamAName || 'Team A') : (game.teamBName || 'Team B')}
           matchLeft={matchLeft}
@@ -318,7 +355,7 @@ export default function CastingDisplay({ route }) {
           winners={leftWinners}
           specials={game?.specials?.[leftKey]}
           theme={theme}
-          accent={leftKey === 'A' ? teamColors.A : teamColors.B}
+          accent={leftKey === 'A' ? colorA : colorB}
           onPickColor={(c) => setTeamColors(prev => ({ ...prev, [leftKey]: c }))}
           detailMode={detailMode}
         />
@@ -330,7 +367,7 @@ export default function CastingDisplay({ route }) {
           winners={rightWinners}
           specials={game?.specials?.[rightKey]}
           theme={theme}
-          accent={rightKey === 'A' ? teamColors.A : teamColors.B}
+          accent={rightKey === 'A' ? colorA : colorB}
           onPickColor={(c) => setTeamColors(prev => ({ ...prev, [rightKey]: c }))}
           detailMode={detailMode}
         />
@@ -341,18 +378,11 @@ export default function CastingDisplay({ route }) {
 
 /* ---------------- structured pieces ---------------- */
 
-function ensureRow(row, team) {
-  if (row) return row;
-  return {
-    team, total:{m:0,a:0}, mid:{m:0,a:0}, long:{m:0,a:0}, money:{m:0,a:0}, gamechanger:{m:0,a:0}, winners:0
-  };
-}
-
 function ScoreRowNormal({
   leftKey, rightKey, theme, colorA, colorB,
   chalLeft, chalRight, matchLeft, matchRight,
   leftIsWinner, rightIsWinner, blinkOn,
-  teamAName, teamBName
+  teamAName, teamBName, shutoutActive
 }) {
   const leftColor = leftKey === 'A' ? colorA : colorB;
   const rightColor = rightKey === 'A' ? colorA : colorB;
@@ -382,11 +412,16 @@ function ScoreRowNormal({
 
         <View style={styles.winnerRow}>
           <Text style={[styles.winnerHint, { opacity: leftIsWinner && blinkOn ? 1 : 0 }]}>WINNER ⟵</Text>
-          <View style={{ flex: 1 }} />
+          <View style={{ flex: 1, alignItems: 'center' }}>
+            {/* NEW: SHUTOUT ×2 pill */}
+            {shutoutActive ? (
+              <View style={styles.shutoutPill}>
+                <Text style={styles.shutoutTxt}>SHUTOUT ×2</Text>
+              </View>
+            ) : null}
+          </View>
           <Text style={[styles.winnerHint, { opacity: rightIsWinner && blinkOn ? 1 : 0 }]}>⟶ WINNER</Text>
         </View>
-
-        {/* Challenge meta moved out in earlier revs – re-add as needed */}
       </View>
 
       {/* Right match */}
@@ -470,7 +505,8 @@ function TeamPanel({
   theme, accent, onPickColor, detailMode
 }) {
   const title = teamKey === 'A' ? 'TEAM A' : 'TEAM B';
-  const fgHeader = `FG ${pctTxt(totals.m, totals.a)} • ${totals.m}/${totals.a}`;
+  const fgPct = pct(totals.m, totals.a);
+  const fgHeader = `FG ${fgPct !== null ? `${fgPct}%` : '—'} • ${totals.m}/${totals.a}`;
 
   const [boxH, setBoxH] = useState(0);
   const rows = Math.max(1, roster.length);
@@ -508,8 +544,8 @@ function TeamPanel({
 }
 
 function PlayerRow({ p, theme, height, detail }) {
-  const fgPct = pct(p.total.m, p.total.a);
-  const fgPctText = p.total.a > 0 ? `${fgPct}%` : '—';
+  const fg = pct(p.total.m, p.total.a);
+  const fgPctText = p.total.a > 0 && fg !== null ? `${fg}%` : '—';
 
   const chip = (label, m, a) => (
     <View style={[styles.chip, { borderColor: theme.divider }]}>
@@ -533,6 +569,7 @@ function PlayerRow({ p, theme, height, detail }) {
             {chip('Long', p.long.m, p.long.a)}
             {chip('$', p.money.m, p.money.a)}
             {chip('GC', p.gamechanger.m, p.gamechanger.a)}
+            {chip('Bonus', p.bonus?.m || 0, p.bonus?.a || 0)} {/* NEW: Bonus chip */}
             <View style={[styles.chip, { borderColor: theme.divider }]}><Text style={[styles.chipTxt, { color: theme.sub }]}>GW {p.winners}</Text></View>
           </View>
         )}
@@ -570,6 +607,17 @@ const styles = StyleSheet.create({
   tintedVal: { fontSize: 42, fontWeight: '900' },
   winnerRow: { width: '100%', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, marginTop: 2 },
   winnerHint: { fontSize: 16, fontWeight: '900', color: '#10b981' },
+
+  // NEW: Shutout pill
+  shutoutPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: '#fff',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#e5e5e5'
+  },
+  shutoutTxt: { fontWeight: '900', color: '#111' },
 
   // BONUS LAYOUT
   bonusRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 14, marginBottom: 6 },
