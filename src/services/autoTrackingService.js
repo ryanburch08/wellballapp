@@ -22,6 +22,7 @@ import {
 import { db, auth } from './firebase';
 import { logShot, listenToGame } from './gameService';
 import { loadCurrentChallenge, shotMatchesRule, normalizeShotKey } from './challengeRules';
+import { listenRoster } from './playerService';
 
 /* ----------------------------------------------------------------------------
 Schema (suggested; works with this coordinator)
@@ -31,15 +32,15 @@ games/{gameId}/auto_events/{eventId}:
   type: 'shot',
   playerId: string,
   team?: 'A'|'B',
-  shotType: 'mid'|'long'|'gamechanger'|'bonus_mid'|'bonus_long'|'bonus_gc'|'bonus', // keep consistent with gameService
+  shotType: 'mid'|'long'|'gamechanger'|'bonus_mid'|'bonus_long'|'bonus_gc'|'bonus',
   made: boolean,
   moneyball?: boolean,
   confidence: number,        // 0..1
   zone?: 'corner'|'wing'|'elbow'|'top'|'gc',
   shotKey?: string,          // e.g. 'mid_corner', 'long_top', 'gc'
-  spotNumber?: number,       // 1..18 (your court map)
-  startSpotId?: string|null, // optional
-  shotSpotId?: string|null,  // optional
+  spotNumber?: number,       // 1..18
+  startSpotId?: string|null,
+  shotSpotId?: string|null,
   sourceCamera?: string,     // deviceId
   ts: Timestamp,
   status?: 'pending'|'processing'|'ingested'|'queued'|'ignored'|'blocked'|'disabled',
@@ -106,11 +107,45 @@ export const setAutoMode = async (
 export const startAutoCoordinator = (gameId) => {
   if (!gameId) return () => {};
 
+  // ✅ FIX: collect all unsubs here
+  const stoppers = [];
+
   // Live game state for gating
   let latestGame = null;
   const stopGame = listenToGame(gameId, (g) => {
     latestGame = g;
   });
+  stoppers.push(() => stopGame && stopGame());
+
+  // Roster → jersey number map
+  let jerseyMap = {};
+  const stopRoster = listenRoster(gameId, (_items, map) => {
+    jerseyMap = map || {};
+  });
+  stoppers.push(() => stopRoster && stopRoster());
+
+  // Wherever you resolve a candidate from camera events:
+  function resolvePlayerIdFromCandidate(cand) {
+    // prefer explicit playerId if detector gave one
+    if (cand.playerId) return cand.playerId;
+
+    // try jersey number
+    const j = Number(cand.jerseyNumber);
+    if (Number.isFinite(j) && jerseyMap[j] && jerseyMap[j].length) {
+      // if multiple players share number, pick the one on the detected team (if provided)
+      if (cand.team && jerseyMap[j].length > 1) {
+        const list = jerseyMap[j].filter((pid) =>
+          (
+            ((latestGame?.teamAIds || []).includes(pid) && cand.team === 'A') ||
+            ((latestGame?.teamBIds || []).includes(pid) && cand.team === 'B')
+          )
+        );
+        if (list.length) return list[0];
+      }
+      return jerseyMap[j][0];
+    }
+    return null;
+  }
 
   // Listen to pending events (oldest first). Feel free to tune the limit.
   const evCol = collection(db, 'games', gameId, 'auto_events');
@@ -126,10 +161,13 @@ export const startAutoCoordinator = (gameId) => {
         setTimeout(() => safeProcessEvent(gameId, ref, latestGame), 0);
       });
   });
+  stoppers.push(() => stopEvents && stopEvents());
 
+  // ✅ Return a single cleanup that calls all unsubs
   return () => {
-    try { stopEvents && stopEvents(); } catch {}
-    try { stopGame && stopGame(); } catch {}
+    stoppers.forEach((fn) => {
+      try { fn && fn(); } catch {}
+    });
   };
 };
 
@@ -200,7 +238,6 @@ const safeProcessEvent = async (gameId, eventRef, latestGame) => {
       const clockOk =
         g?.status === 'live' && g?.clockRunning === true && g?.paused !== true;
       if (!clockOk) {
-        // Leave in pending? Safer to mark blocked so the queue doesn’t balloon.
         await updateDoc(eventRef, {
           status: 'blocked',
           error: 'Clock not running or game paused',
@@ -342,12 +379,10 @@ const ingestShot = async (gameId, ev, eventRef) => {
   }
 };
 
-
 // Derive a descriptive key when the detector didn’t provide one.
 const deriveShotKey = (shotType, zone, provided) => {
   if (provided) return provided;
   if (!shotType) return null;
-  // Normalize a few common patterns
   if (shotType === 'gamechanger' || shotType === 'bonus_gc') return 'gc';
   const range =
     shotType === 'mid' || shotType === 'bonus_mid'

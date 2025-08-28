@@ -6,6 +6,8 @@ import { doc, onSnapshot, collection, query, orderBy, onSnapshot as onSnapCol, u
 import { setPaused, toggleFlipSides } from '../services/gameService';
 import CameraStatusBar from '../components/CameraStatusBar';
 import { startAutoCoordinator, setAutoMode } from '../services/autoTrackingService';
+// ROSTER ADDITIONS
+import { listenRoster } from '../services/playerService';
 
 import {
   logShot,
@@ -78,6 +80,20 @@ export default function StatEntryScreen({ route, navigation }) {
   // proposals badge
   const [pendingCount, setPendingCount] = useState(0);
 
+  // ROSTER ADDITIONS
+  const [roster, setRoster] = useState([]);
+  useEffect(() => {
+    if (!gameId) return;
+    const stop = listenRoster(gameId, (items /*, jerseyMap */) => setRoster(items));
+    return () => stop && stop();
+  }, [gameId]);
+
+  const rosterById = useMemo(() => {
+    const m = {};
+    roster.forEach(r => { m[r.id] = r; });
+    return m;
+  }, [roster]);
+
   // subscribe to game + logs
   useEffect(() => {
     if (!gameId) return;
@@ -142,6 +158,22 @@ export default function StatEntryScreen({ route, navigation }) {
       ...((game.teamBIds || []).map(id => ({ id, team: 'B' }))),
     ];
   }, [game]);
+
+  // ROSTER ADDITIONS: compute missing # / face for active players
+  const rosterIssues = useMemo(() => {
+    if (!game) return { missingNum: [], missingFace: [] };
+    const ids = [...(game.teamAIds || []), ...(game.teamBIds || [])];
+    const missingNum = [];
+    const missingFace = [];
+    ids.forEach(pid => {
+      const r = rosterById[pid];
+      const hasNum = Number.isFinite(Number(r?.jerseyNumber));
+      const hasFace = !!r?.faceUrl;
+      if (!hasNum) missingNum.push(pid);
+      if (!hasFace) missingFace.push(pid);
+    });
+    return { missingNum, missingFace };
+  }, [game, rosterById]);
 
   const playerTeamKey = (playerId) => {
     if (game?.teamAIds?.includes(playerId)) return 'A';
@@ -328,6 +360,7 @@ export default function StatEntryScreen({ route, navigation }) {
   const currIdx = Number(game.currentChallengeIndex ?? 0);
   const nextIdx = currIdx + 1 < totalChallenges ? currIdx + 1 : null;
 
+  // ----- UI -----
   return (
     <View style={styles.container}>
       <Text style={styles.h1}>Stat Entry</Text>
@@ -343,6 +376,23 @@ export default function StatEntryScreen({ route, navigation }) {
         onAddCamera={() => navigation.navigate('CameraRegistration', { gameId })}
       />
       <AutoModePanel game={game} gameId={gameId} navigation={navigation} />
+
+      {/* ROSTER ADDITIONS: completeness warning */}
+      {(rosterIssues.missingNum.length > 0 || rosterIssues.missingFace.length > 0) && (
+        <View style={styles.warnBanner}>
+          <Text style={styles.warnTxt}>
+            {rosterIssues.missingNum.length > 0 ? `${rosterIssues.missingNum.length} missing jersey #` : ''}
+            {(rosterIssues.missingNum.length > 0 && rosterIssues.missingFace.length > 0) ? ' • ' : ''}
+            {rosterIssues.missingFace.length > 0 ? `${rosterIssues.missingFace.length} missing face` : ''}
+          </Text>
+          <TouchableOpacity
+            style={styles.warnBtn}
+            onPress={() => navigation.navigate('RosterSetup', { gameId })}
+          >
+            <Text style={styles.warnBtnTxt}>Fix Roster</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {game.paused && (
         <View style={styles.pausedBanner}>
@@ -500,6 +550,12 @@ export default function StatEntryScreen({ route, navigation }) {
                     <Text style={styles.smallBtnTxt}>Clear B</Text>
                   </TouchableOpacity>
                 </View>
+                <TouchableOpacity
+                  style={styles.smallBtn}
+                  onPress={() => navigation.navigate('RosterSetup', { gameId })}
+                >
+                  <Text style={styles.smallBtnTxt}>Roster Setup</Text>
+                </TouchableOpacity>
 
                 <View style={{ marginTop: 6 }}>
                   {trackers
@@ -608,10 +664,12 @@ export default function StatEntryScreen({ route, navigation }) {
         renderItem={({ item }) => {
           const disabled = !canTap(item.id) || !!won;
           const last = lastByPlayer[item.id];
+          const r = rosterById[item.id]; // ROSTER ADDITIONS
+          const jersey = Number.isFinite(Number(r?.jerseyNumber)) ? `  #${r.jerseyNumber}` : '';
           return (
             <View style={[styles.card, item.team === 'A' ? styles.cardA : styles.cardB, disabled && styles.cardDisabled]}>
               <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <Text style={styles.playerName}>{item.id}</Text>
+                <Text style={styles.playerName}>{item.id}{jersey}</Text>
                 <Text style={styles.lastShotTag}>Last: {last ? lastLabel(last) : '—'}</Text>
               </View>
 
@@ -760,6 +818,12 @@ const styles = StyleSheet.create({
 
   pausedBanner: { backgroundColor: '#fde68a', borderColor: '#f59e0b', borderWidth: 1, padding: 8, borderRadius: 8, marginBottom: 8 },
   pausedTxt: { color: '#7c2d12', fontWeight: '800', textAlign: 'center' },
+
+  // ROSTER ADDITIONS
+  warnBanner: { flexDirection:'row', alignItems:'center', justifyContent:'space-between', backgroundColor:'#fee2e2', borderColor:'#fecaca', borderWidth:1, padding:8, borderRadius:8, marginBottom:8 },
+  warnTxt: { color:'#7f1d1d', fontWeight:'700' },
+  warnBtn: { backgroundColor:'#7f1d1d', paddingHorizontal:10, paddingVertical:6, borderRadius:8 },
+  warnBtnTxt: { color:'#fff', fontWeight:'800' },
 
   badge: { position: 'absolute', top: -6, right: -6, backgroundColor: '#ef4444', borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2, minWidth: 20, alignItems: 'center' },
   badgeTxt: { color: '#fff', fontWeight: '800', fontSize: 12 },

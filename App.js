@@ -18,6 +18,7 @@ import StatEntryScreen from './src/screens/StatEntryScreen';
 import SignupScreen from './src/screens/SignupScreen';
 import LoginScreen from './src/screens/LoginScreen';
 import BoxScoreScreen from './src/screens/BoxScoreScreen';
+import RosterSetupScreen from './src/screens/RosterSetupScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -77,6 +78,11 @@ export default function App() {
             name="CastingDisplay"
             component={CastingDisplay}
             options={{ headerShown: false, presentation: 'fullScreenModal' }}
+          />
+          <Stack.Screen
+            name="RosterSetup"
+            component={require('./src/screens/RosterSetupScreen').default}
+            options={{ headerShown: true, title: 'Roster Setup' }}
           />
           <Stack.Screen
             name="StatEntryScreen"
